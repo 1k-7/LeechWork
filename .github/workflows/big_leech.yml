@@ -1,0 +1,68 @@
+name: Big Leech (Session String)
+
+on:
+  repository_dispatch:
+    types: [big_leech]
+
+jobs:
+  upload-big-file:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install pyrogram tgcrypto yt-dlp
+
+      - name: Run Leech
+        env:
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          LINK: ${{ github.event.client_payload.url }}
+        run: |
+          python3 <<EOF
+          import os
+          import asyncio
+          from pyrogram import Client
+          import yt_dlp
+
+          async def main():
+              api_id = 123456  # You can leave generic or use yours
+              api_hash = "0123456789abcdef0123456789abcdef" 
+              
+              # Initialize User Client (The Session String does the magic)
+              app = Client("my_account", session_string=os.environ['SESSION_STRING'], no_updates=True)
+              
+              url = os.environ['LINK']
+              chat_id = int(os.environ['CHAT_ID'])
+              
+              print(f"🚀 Processing: {url}")
+              
+              # Download with yt-dlp (Best quality, no 50MB limit!)
+              ydl_opts = {'outtmpl': '%(title)s.%(ext)s', 'quiet': True}
+              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                  info = ydl.extract_info(url, download=True)
+                  filename = ydl.prepare_filename(info)
+
+              print(f"✅ Downloaded: {filename}")
+              
+              # Upload with Pyrogram (Supports 2GB+)
+              async with app:
+                  await app.send_message(chat_id, f"⬇️ Uploading **{filename}** via Session...")
+                  
+                  def progress(current, total):
+                      print(f"Uploading: {current * 100 / total:.1f}%")
+
+                  await app.send_document(
+                      chat_id, 
+                      document=filename, 
+                      caption=f"📦 **{filename}**",
+                      progress=progress
+                  )
+          
+          asyncio.run(main())
+          EOF
+nloadnload
