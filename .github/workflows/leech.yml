@@ -1,0 +1,136 @@
+name: Big Leech Runner
+
+on:
+  repository_dispatch:
+    types: [big_leech]
+
+jobs:
+  upload-big-file:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Tools
+        run: |
+          pip install pyrogram tgcrypto yt-dlp
+          sudo apt-get install -y ffmpeg
+
+      - name: Run Leech
+        env:
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          LINK: ${{ github.event.client_payload.url }}
+        run: |
+          python3 <<EOF
+          import os
+          import time
+          import asyncio
+          import glob
+          import traceback
+          from pyrogram import Client
+          import yt_dlp
+
+          # GLOBAL VARS FOR PROGRESS
+          last_edit_time = 0
+          status_msg = None
+
+          async def progress(current, total):
+              global last_edit_time, status_msg
+              try:
+                  now = time.time()
+                  # Only edit every 7 seconds to avoid Telegram "FloodWait" bans
+                  if status_msg and (now - last_edit_time > 7):
+                      percent = current * 100 / total
+                      await status_msg.edit_text(f"⬆️ **Uploading:** {percent:.1f}%")
+                      last_edit_time = now
+              except Exception:
+                  pass # Ignore edit errors
+
+          async def main():
+              global status_msg
+              
+              # 1. VALIDATE ENV
+              if not os.environ.get('SESSION_STRING'):
+                  print("❌ Error: SESSION_STRING is missing in GitHub Secrets!")
+                  return
+
+              # 2. LOGIN
+              try:
+                  # Use your own API ID/HASH if you have them, or these public test ones
+                  app = Client(
+                      "leech_session", 
+                      session_string=os.environ['SESSION_STRING'], 
+                      api_id=2040, 
+                      api_hash="b18441a1ff607e10a989891a5462e627"
+                  )
+                  await app.start()
+              except Exception as e:
+                  print(f"❌ Login Failed: {e}")
+                  return
+
+              chat_id = int(os.environ['CHAT_ID'])
+              url = os.environ['LINK']
+
+              try:
+                  # Notify User
+                  status_msg = await app.send_message(chat_id, f"🚀 **GitHub Runner Active**\n⚙️ Processing: `{url}`")
+                  
+                  # 3. DOWNLOAD (yt-dlp)
+                  await status_msg.edit_text(f"⬇️ **Downloading...**\n(This happens on server, please wait)")
+                  
+                  ydl_opts = {
+                      'outtmpl': '%(title)s.%(ext)s',
+                      'quiet': True,
+                      'format': 'bestvideo+bestaudio/best',
+                      'merge_output_format': 'mp4'
+                  }
+                  
+                  filename = None
+                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                      info = ydl.extract_info(url, download=True)
+                      filename = ydl.prepare_filename(info)
+                      # Handle merged filenames
+                      if not os.path.exists(filename):
+                          base = os.path.splitext(filename)[0]
+                          files = glob.glob(base + "*")
+                          if files: filename = files[0]
+
+                  if not filename:
+                      raise Exception("Download failed, no file found.")
+
+                  # 4. UPLOAD
+                  file_size = os.path.getsize(filename) / (1024 * 1024)
+                  await status_msg.edit_text(f"⬆️ **Starting Upload:** `{filename}`\n📦 Size: {file_size:.2f} MB")
+                  
+                  # Send Document with Progress
+                  await app.send_document(
+                      chat_id, 
+                      document=filename, 
+                      caption=f"📦 **{filename}**",
+                      progress=progress
+                  )
+                  
+                  await status_msg.delete() # Clean up status message
+                  await app.send_message(chat_id, "✅ **Upload Complete!**")
+                  
+                  # Cleanup file
+                  if os.path.exists(filename): os.remove(filename)
+
+              except Exception as e:
+                  err_text = f"❌ **Error:** {str(e)}"
+                  print(err_text)
+                  if status_msg:
+                      await status_msg.edit_text(err_text)
+                  else:
+                      await app.send_message(chat_id, err_text)
+                  traceback.print_exc()
+
+              finally:
+                  await app.stop()
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          EOF
