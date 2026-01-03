@@ -1,11 +1,11 @@
 /**
- * CLOUDFLARE SERVERLESS LEECH BOT (Ultimate Version)
- * Limits: 50MB Max File Size | ~100s Time Limit
+ * CLOUDFLARE WORKER LEECH BOT (Ultimate + yt-dlp Support)
+ * Supports: Direct Links AND YouTube/TikTok/Insta (via Cobalt API)
+ * Limit: 50MB (Telegram API Hard Limit)
  */
 
 export default {
   async fetch(request, env, ctx) {
-    // Only accept POST from Telegram
     if (request.method === "POST") {
       try {
         const update = await request.json();
@@ -17,10 +17,10 @@ export default {
           // --- COMMAND: /start ---
           if (text === "/start") {
              await sendMessage(env.BOT_TOKEN, chatId, 
-               "👋 **Leech Bot Ready!**\n\n" +
-               "I can stream direct links to Telegram.\n" +
+               "👋 **I am evolved!**\n\n" +
+               "I can leech Direct Links AND Social Media (YouTube, TikTok, Insta).\n" +
                "**Limit:** 50MB per file.\n\n" +
-               "**Usage:**\n`/leech http://example.com/video.mp4`"
+               "**Usage:**\n`/leech <any_url>`"
              );
              return new Response("OK");
           }
@@ -34,11 +34,11 @@ export default {
               return new Response("OK");
             }
 
-            // Ack command
-            await sendMessage(env.BOT_TOKEN, chatId, "⏳ **Checking link...**");
+            // Acknowledge
+            await sendMessage(env.BOT_TOKEN, chatId, "🔍 **Analyzing Link...**");
 
-            // Run background process
-            ctx.waitUntil(processLeech(url, chatId, env.BOT_TOKEN));
+            // Trigger Background Process
+            ctx.waitUntil(handleDownload(url, chatId, env.BOT_TOKEN));
 
             return new Response("OK");
           }
@@ -51,8 +51,77 @@ export default {
   }
 };
 
-// --- CORE FUNCTIONS ---
+// --- CORE LOGIC ---
 
+async function handleDownload(userUrl, chatId, botToken) {
+    try {
+        let finalUrl = userUrl;
+        let filename = "download";
+
+        // 1. CHECK IF NEEDS YT-DLP (Social Media)
+        // Simple regex for common sites that need processing
+        const needsYtdlp = /youtube\.com|youtu\.be|tiktok\.com|instagram\.com|twitter\.com|x\.com|twitch\.tv/.test(userUrl);
+
+        if (needsYtdlp) {
+            await sendMessage(botToken, chatId, "⚙️ **Processing with yt-dlp...**\n(This relies on external APIs, might take a moment)");
+            
+            // Call Cobalt API to get a direct link
+            const cobaltData = await resolveCobalt(userUrl);
+            
+            if (!cobaltData || !cobaltData.url) {
+                throw new Error("Could not extract video. The link might be unsupported or too long.");
+            }
+
+            finalUrl = cobaltData.url;
+            // Try to use the filename the API gave us, if any
+            if (cobaltData.filename) filename = cobaltData.filename;
+            
+            console.log("Resolved URL:", finalUrl);
+        }
+
+        // 2. START STREAMING
+        await processLeech(finalUrl, chatId, botToken, filename);
+
+    } catch (error) {
+        await sendMessage(botToken, chatId, `❌ **Error:** ${error.message}`);
+    }
+}
+
+// Helper: Resolve URL using Cobalt API (Free yt-dlp wrapper)
+async function resolveCobalt(url) {
+    const apiInstances = [
+        "https://api.cobalt.tools/api/json", // Official
+        "https://co.wuk.sh/api/json",        // Backup 1
+        "https://cobalt.steamys.me/api/json" // Backup 2
+    ];
+
+    // Try instances until one works
+    for (const api of apiInstances) {
+        try {
+            const response = await fetch(api, {
+                method: "POST",
+                headers: { 
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    url: url,
+                    vQuality: "720", // Request 720p to stay under 50MB
+                    filenamePattern: "basic"
+                })
+            });
+            
+            const data = await response.json();
+            if (data.url) return data;
+        } catch (e) {
+            console.log(`Failed Cobalt instance ${api}:`, e);
+            continue; // Try next instance
+        }
+    }
+    return null;
+}
+
+// Helper: Send Message
 async function sendMessage(token, chatId, text) {
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
@@ -61,48 +130,49 @@ async function sendMessage(token, chatId, text) {
   });
 }
 
-async function processLeech(fileUrl, chatId, botToken) {
+// Helper: The Heavy Lifter (Streamer)
+async function processLeech(fileUrl, chatId, botToken, suggestedName) {
   try {
-    // 1. Fetch Source with User Agent (bypasses some blocks)
+    // A. Fetch Source
     let sourceResponse = await fetch(fileUrl, {
         headers: { 
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" 
         }
     });
     
-    if (!sourceResponse.ok) throw new Error(`HTTP Error ${sourceResponse.status}`);
+    if (!sourceResponse.ok) throw new Error(`HTTP Source Error ${sourceResponse.status}`);
 
-    // 2. Determine File Size (Critical for Telegram)
+    // B. Get Size
     let fileSize = sourceResponse.headers.get("content-length");
     let streamToUpload = sourceResponse.body;
 
-    // FALLBACK: If no size header, buffer in RAM (Risk: Crashes on large files)
+    // Fallback if no size (Buffer RAM)
     if (!fileSize) {
         try {
-            // We have to consume the stream to measure it
             const blob = await sourceResponse.blob();
             fileSize = blob.size;
-            streamToUpload = blob.stream(); // Create new stream from blob
+            streamToUpload = blob.stream();
         } catch (e) {
-            throw new Error("Source server didn't provide size, and file is too big to buffer.");
+            throw new Error("Source provided no size, and buffering failed.");
         }
     }
 
-    // Check Limits
     const sizeInt = parseInt(fileSize);
-    if (sizeInt > 52428800) { // 50MB
-        throw new Error(`File is ${(sizeInt/1024/1024).toFixed(2)}MB. Limit is 50MB.`);
+    if (sizeInt > 52428800) { // 50MB Limit
+        throw new Error(`File is ${(sizeInt/1024/1024).toFixed(2)}MB. Telegram Limit is 50MB.`);
     }
 
-    // 3. Smart Filename Logic
-    let filename = "downloaded_file";
+    // C. Determine Filename
+    let filename = suggestedName;
     const disposition = sourceResponse.headers.get("content-disposition");
     
+    // Priority 1: Header from Source
     if (disposition && disposition.includes("filename=")) {
         const match = disposition.match(/filename=["']?([^"';]+)["']?/);
         if (match && match[1]) filename = match[1];
-    } else {
-        // Try from URL
+    } 
+    // Priority 2: URL Name (if suggestedName is generic)
+    else if (filename === "download") {
         try {
             const urlPath = new URL(fileUrl).pathname;
             const urlName = urlPath.split("/").pop();
@@ -110,34 +180,28 @@ async function processLeech(fileUrl, chatId, botToken) {
         } catch(e) {}
     }
 
-    // Fix Extension if missing
+    // Ensure extension
     if (!filename.includes(".")) {
         const cType = sourceResponse.headers.get("content-type") || "";
-        if (cType.includes("video/mp4")) filename += ".mp4";
-        else if (cType.includes("matroska")) filename += ".mkv";
-        else if (cType.includes("jpeg")) filename += ".jpg";
-        else if (cType.includes("png")) filename += ".png";
-        else if (cType.includes("pdf")) filename += ".pdf";
+        if (cType.includes("video")) filename += ".mp4";
+        else if (cType.includes("image")) filename += ".jpg";
         else filename += ".bin";
     }
 
-    // Update Status
     await sendMessage(botToken, chatId, `⬇️ **Downloading:** \`${filename}\`\n📦 **Size:** ${(sizeInt/1024/1024).toFixed(2)}MB`);
 
-    // 4. Construct Multipart Stream
+    // D. Build Stream (Multipart)
     const boundary = "----CloudflareBoundary" + Math.random().toString(36).substring(2);
-    
     const header = `--${boundary}\r\n` +
                    `Content-Disposition: form-data; name="chat_id"\r\n\r\n` +
                    `${chatId}\r\n` +
                    `--${boundary}\r\n` +
                    `Content-Disposition: form-data; name="document"; filename="${filename}"\r\n` +
                    `Content-Type: application/octet-stream\r\n\r\n`;
-
     const footer = `\r\n--${boundary}--\r\n`;
     const totalSize = new Blob([header]).size + sizeInt + new Blob([footer]).size;
 
-    // 5. Pipe Data
+    // E. Pipe Data
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
@@ -158,7 +222,7 @@ async function processLeech(fileUrl, chatId, botToken) {
         }
     })();
 
-    // 6. Send to Telegram
+    // F. Send to Telegram
     const upload = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
         method: "POST",
         headers: {
@@ -172,6 +236,6 @@ async function processLeech(fileUrl, chatId, botToken) {
     if (!result.ok) throw new Error(result.description);
 
   } catch (error) {
-    await sendMessage(botToken, chatId, `❌ **Error:** ${error.message}`);
+    await sendMessage(botToken, chatId, `❌ **Upload Failed:** ${error.message}`);
   }
 }
