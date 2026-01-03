@@ -1,8 +1,7 @@
 /**
- * HYBRID LEECH BOT (Cloudflare + GitHub)
- * - Handles <50MB directly via Stream Splicing
- * - Offloads >50MB to GitHub Actions (Session String)
- * - Resolves YouTube/Social links via Cobalt
+ * HYBRID LEECH BOT (Final Debug Version)
+ * - Reports exact errors if GitHub fails to trigger.
+ * - Handles Cobalt resolution for social links.
  */
 
 export default {
@@ -14,19 +13,16 @@ export default {
           const text = update.message.text;
           const chatId = update.message.chat.id;
 
-          // --- COMMAND: /start ---
           if (text === "/start") {
              await sendMessage(env.BOT_TOKEN, chatId, 
-               "👋 **Hybrid Leech Bot Online**\n\n" +
-               "🔹 **Direct & Social Links Supported**\n" +
+               "👋 **Hybrid Leech Bot**\n\n" +
                "🔹 **< 50MB:** Instant Cloudflare Upload\n" +
-               "🔹 **> 50MB:** Auto-offload to GitHub (2GB Limit)\n\n" +
+               "🔹 **> 50MB:** Auto-offload to GitHub\n\n" +
                "**Usage:** `/leech <link>`"
              );
              return new Response("OK");
           }
 
-          // --- COMMAND: /leech ---
           if (text.startsWith("/leech")) {
             const url = text.split(/\s+/)[1];
             if (!url) {
@@ -34,7 +30,7 @@ export default {
               return new Response("OK");
             }
 
-            await sendMessage(env.BOT_TOKEN, chatId, "🔍 **Processing...**");
+            await sendMessage(env.BOT_TOKEN, chatId, "🔍 **Analyzing...**");
             ctx.waitUntil(handleRequest(url, chatId, env));
             return new Response("OK");
           }
@@ -47,21 +43,19 @@ export default {
   }
 };
 
-// --- MAIN CONTROLLER ---
 async function handleRequest(userUrl, chatId, env) {
     try {
         let finalUrl = userUrl;
         let filename = "download";
         
-        // 1. Resolve Social Media (YouTube/TikTok/etc) via Cobalt
+        // 1. Resolve Social Media
         const isSocial = /youtube|youtu\.be|tiktok|instagram|twitter|x\.com|twitch/.test(userUrl);
         if (isSocial) {
             await sendMessage(env.BOT_TOKEN, chatId, "⚙️ **Resolving via Cobalt...**");
             const cobalt = await resolveCobalt(userUrl);
             if (!cobalt) {
-                // If Cobalt fails, we can try sending to GitHub directly as a fallback
                 if (env.GITHUB_TOKEN) {
-                     await sendMessage(env.BOT_TOKEN, chatId, "⚠️ Cobalt failed. Offloading task to GitHub...");
+                     await sendMessage(env.BOT_TOKEN, chatId, "⚠️ Cobalt failed. Trying GitHub directly...");
                      await triggerGitHub(userUrl, chatId, env);
                      return;
                 }
@@ -71,26 +65,22 @@ async function handleRequest(userUrl, chatId, env) {
             if (cobalt.filename) filename = cobalt.filename;
         }
 
-        // 2. Check File Size (HEAD Request)
+        // 2. Check File Size
         let size = 0;
         try {
             const head = await fetch(finalUrl, { method: "HEAD", headers: {"User-Agent": "Mozilla/5.0"} });
-            if (head.ok) {
-                size = parseInt(head.headers.get("content-length") || "0");
-            }
+            if (head.ok) size = parseInt(head.headers.get("content-length") || "0");
         } catch (e) {}
 
-        // 3. DECISION MATRIX
+        // 3. Decision
         if (size > 52428800) { 
-            // CASE A: File > 50MB
             if (env.GITHUB_TOKEN) {
-                await sendMessage(env.BOT_TOKEN, chatId, `📦 **File is ${(size/1024/1024).toFixed(2)}MB** (>50MB).\n🚀 Activating GitHub Session Uploader...`);
-                await triggerGitHub(userUrl, chatId, env); // Send original URL to GitHub
+                await sendMessage(env.BOT_TOKEN, chatId, `📦 **File is ${(size/1024/1024).toFixed(2)}MB** (>50MB).\n🚀 sending signal to GitHub...`);
+                await triggerGitHub(userUrl, chatId, env);
             } else {
-                throw new Error(`File is ${(size/1024/1024).toFixed(2)}MB. Limit is 50MB (Add GITHUB_TOKEN to bypass).`);
+                throw new Error("File too big (>50MB) and no GITHUB_TOKEN configured.");
             }
         } else {
-            // CASE B: File < 50MB (Stream Locally)
             await streamToTelegram(finalUrl, chatId, env.BOT_TOKEN, filename);
         }
 
@@ -99,33 +89,54 @@ async function handleRequest(userUrl, chatId, env) {
     }
 }
 
-// --- HELPER: STREAM SPLICING (Local Upload) ---
+// --- DEBUG TRIGGER GITHUB ---
+async function triggerGitHub(url, chatId, env) {
+    if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) {
+        throw new Error("Missing GITHUB_TOKEN or GITHUB_REPO in Settings.");
+    }
+    
+    // Log the attempt to Telegram
+    const repo = env.GITHUB_REPO;
+    
+    const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
+        method: "POST",
+        headers: {
+            "Authorization": `token ${env.GITHUB_TOKEN}`,
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "Cloudflare-Worker"
+        },
+        body: JSON.stringify({ event_type: "big_leech", client_payload: { url: url, chat_id: chatId } })
+    });
+
+    if (!res.ok) {
+        const err = await res.text();
+        await sendMessage(env.BOT_TOKEN, chatId, `❌ **GitHub Refused!**\nStatus: ${res.status}\nReason: ${err}\n\n*Check your GITHUB_REPO and GITHUB_TOKEN settings.*`);
+    } else {
+        await sendMessage(env.BOT_TOKEN, chatId, "✅ **Signal Sent!**\nWaiting for GitHub to wake up (10-30s)...");
+    }
+}
+
+// --- STANDARD HELPERS ---
 async function streamToTelegram(fileUrl, chatId, botToken, suggestedName) {
-    // (This is the same stream code from previous steps - condensed for length)
     try {
         const source = await fetch(fileUrl, { headers: {"User-Agent": "Mozilla/5.0"} });
         if (!source.ok) throw new Error("Source URL unreachable");
         
         let fileSize = parseInt(source.headers.get("content-length") || "0");
         let stream = source.body;
-
-        // RAM Buffer fallback if no size
         if (!fileSize) {
              const blob = await source.blob();
              fileSize = blob.size;
              stream = blob.stream();
-             if (fileSize > 52428800) throw new Error("File too big for RAM buffer.");
         }
 
-        // Filename Logic
         let filename = suggestedName;
         const disp = source.headers.get("content-disposition");
         if (disp && disp.includes("filename=")) filename = disp.match(/filename=["']?([^"';]+)["']?/)[1];
-        if (!filename.includes(".")) filename += ".mp4"; // Default extension
+        if (!filename.includes(".")) filename += ".mp4";
 
         await sendMessage(botToken, chatId, `⬇️ **Streaming:** \`${filename}\``);
 
-        // Build Multipart
         const boundary = "----Cloudflare" + Math.random().toString(36).slice(2);
         const header = `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n` +
                        `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\n` +
@@ -156,7 +167,6 @@ async function streamToTelegram(fileUrl, chatId, botToken, suggestedName) {
     }
 }
 
-// --- HELPER: COBALT RESOLVER (Improved) ---
 async function resolveCobalt(url) {
     const instances = ["https://api.cobalt.tools/api/json", "https://co.wuk.sh/api/json", "https://api.wkr.tools/api/json"];
     for (const api of instances) {
@@ -171,22 +181,6 @@ async function resolveCobalt(url) {
         } catch (e) {}
     }
     return null;
-}
-
-// --- HELPER: TRIGGER GITHUB ACTION ---
-async function triggerGitHub(url, chatId, env) {
-    if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) throw new Error("GitHub credentials missing in Cloudflare.");
-    
-    const res = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
-        method: "POST",
-        headers: {
-            "Authorization": `token ${env.GITHUB_TOKEN}`,
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Cloudflare-Worker"
-        },
-        body: JSON.stringify({ event_type: "big_leech", client_payload: { url: url, chat_id: chatId } })
-    });
-    if (!res.ok) throw new Error(`GitHub Trigger Failed: ${res.status}`);
 }
 
 async function sendMessage(token, chatId, text) {
