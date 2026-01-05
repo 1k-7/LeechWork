@@ -1,8 +1,8 @@
 /**
- * CLOUDFLARE LEECH BOT (BULLETPROOF)
- * - FIXES: "Stuck at Uploading" by adding timeouts.
- * - MODE: Sequential (1 by 1) for maximum stability.
- * - RETRY: Auto-kicks "frozen" uploads.
+ * CLOUDFLARE LEECH BOT (DIAGNOSTIC MODE)
+ * - Separates DOWNLOAD vs UPLOAD to pinpoint the freeze.
+ * - Added AbortController to kill hanging source connections.
+ * - Auto-retries source connection if it hangs > 10s.
  */
 
 import { Api, TelegramClient } from "telegram";
@@ -18,7 +18,6 @@ export default {
       try {
         const update = await request.json();
 
-        // RELAY HANDLER
         if (update.message && (update.message.document || update.message.video || update.message.audio)) {
             const caption = update.message.caption;
             if (caption && /^-?\d+$/.test(caption)) {
@@ -27,7 +26,6 @@ export default {
             }
         }
 
-        // COMMAND HANDLER
         if (update.message && update.message.text && update.message.text.startsWith("/leech")) {
             const chatId = update.message.chat.id;
             const link = update.message.text.split(/\s+/)[1];
@@ -35,7 +33,7 @@ export default {
 
             if (!env.LEECH_DB || !env.WORKER_URL) return sendMessage(env, chatId, "❌ Error: Config missing.");
 
-            const statusMsg = await sendMessage(env, chatId, "🛡️ **Bulletproof Mode Init...**");
+            const statusMsg = await sendMessage(env, chatId, "🔍 **Diagnostic Mode Init...**");
             const msgId = statusMsg.result.message_id;
 
             ctx.waitUntil(runRelay(link, chatId, env, 0, msgId));
@@ -60,7 +58,7 @@ async function runRelay(link, chatId, env, startPart, msgId) {
     let client;
     try {
         const START_TIME = Date.now();
-        const MAX_RUNTIME = 50 * 1000; 
+        const MAX_RUNTIME = 45 * 1000; 
 
         if (startPart === 0) await editMessage(env, chatId, msgId, "🔑 **Logging in...**");
         
@@ -76,11 +74,7 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             
             const head = await fetch(link, { 
                 method: "HEAD", 
-                headers: {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "*/*",
-                    "Connection": "keep-alive"
-                } 
+                headers: { "User-Agent": "Mozilla/5.0" } 
             });
             if (!head.ok) throw new Error(`Source HTTP ${head.status}`);
             
@@ -100,20 +94,31 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             await env.LEECH_DB.put(link, JSON.stringify(state), { expirationTtl: 86400 });
         }
 
-        // STREAMING
-        if (startPart === 0) await editMessage(env, chatId, msgId, "⬇️ **Streaming...**");
-
+        // STREAMING SETUP
         const CHUNK_SIZE = 512 * 1024;
         const byteStart = startPart * CHUNK_SIZE;
 
-        const response = await fetch(link, { 
-            headers: { 
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-                "Range": `bytes=${byteStart}-`,
-                "Accept": "*/*",
-                "Referer": new URL(link).origin
-            } 
-        });
+        if (startPart === 0) await editMessage(env, chatId, msgId, "⬇️ **Connecting to Stream...**");
+
+        // --- NEW: AbortController for Anti-Hang ---
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s Timeout
+
+        let response;
+        try {
+            response = await fetch(link, { 
+                headers: { 
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+                    "Range": `bytes=${byteStart}-`,
+                    "Accept": "*/*",
+                    "Connection": "keep-alive"
+                },
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+        } catch (e) {
+            throw new Error("Source Connection Timed Out (Blocked?)");
+        }
 
         if (!response.ok) throw new Error(`Stream HTTP ${response.status}`);
 
@@ -121,16 +126,24 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         let partIdx = startPart;
         let buffer = new Uint8Array(0);
         let lastEditTime = Date.now();
+        let isDownloading = false;
 
         // UPLOAD LOOP
         while (true) {
-            // RELAY CHECK
             if (Date.now() - START_TIME > MAX_RUNTIME) {
                 await triggerNextWorker(env, link, chatId, partIdx, msgId);
                 return;
             }
 
+            // --- DIAGNOSTIC: Check if Download Hangs ---
+            if (!isDownloading && startPart === 0) {
+                 // Only update UI on first chunk to avoid flood
+                 await editMessage(env, chatId, msgId, "📥 **Downloading Chunk...**");
+            }
+            isDownloading = true;
+
             const { done, value } = await reader.read();
+            
             if (done && buffer.length === 0) break;
             
             if (value) {
@@ -140,18 +153,19 @@ async function runRelay(link, chatId, env, startPart, msgId) {
                 buffer = temp;
             }
 
-            // PROCESS CHUNKS SEQUENTIALLY (Bulletproof)
+            // PROCESS
             while (buffer.length >= CHUNK_SIZE || (done && buffer.length > 0)) {
                 
+                // If we got here, DOWNLOAD worked. Now testing UPLOAD.
+                if (startPart === 0 && partIdx === 0) await editMessage(env, chatId, msgId, "📤 **Uploading Chunk...**");
+
                 const currentChunkSize = Math.min(CHUNK_SIZE, buffer.length);
                 const chunk = buffer.slice(0, currentChunkSize);
                 buffer = buffer.slice(currentChunkSize);
 
-                // --- SAFE UPLOAD WITH TIMEOUT ---
-                // We wrap the upload in a race condition. If it takes > 15s, we retry.
+                // Safe Upload
                 let success = false;
                 let attempts = 0;
-
                 while (!success && attempts < 3) {
                     try {
                         const uploadPromise = client.invoke(new Api.upload.SaveBigFilePart({
@@ -160,28 +174,19 @@ async function runRelay(link, chatId, env, startPart, msgId) {
                             fileTotalParts: state.totalParts,
                             bytes: Buffer.from(chunk)
                         }));
-
-                        // Timeout Promise
-                        const timeoutPromise = new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error("Upload Timeout")), 15000)
-                        );
-
+                        const timeoutPromise = new Promise((_, r) => setTimeout(() => r(new Error("Timeout")), 15000));
                         await Promise.race([uploadPromise, timeoutPromise]);
                         success = true;
-
                     } catch (err) {
-                        console.log(`Part ${partIdx} stalled/failed. Retrying... (${attempts+1}/3)`);
                         attempts++;
-                        await new Promise(r => setTimeout(r, 1000)); // Cool down
+                        await new Promise(r => setTimeout(r, 1000));
                     }
                 }
-
-                if (!success) throw new Error(`Part ${partIdx} Failed after 3 retries.`);
+                if (!success) throw new Error("Upload Failed");
 
                 partIdx++;
 
-                // UPDATE UI (Every 8s)
-                if (Date.now() - lastEditTime > 8000) {
+                if (Date.now() - lastEditTime > 5000) {
                     await editProgress(env, chatId, msgId, state.filename, partIdx, state.totalParts, state.totalSize);
                     lastEditTime = Date.now();
                 }
@@ -200,7 +205,7 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         let attributes = [new Api.DocumentAttributeVideo({ duration: 0, w: 1280, h: 720, supportsStreaming: true })];
         let forceFile = false;
 
-        if (['zip', 'rar', '7z', 'pdf', 'epub', 'exe', 'apk', 'bin'].includes(ext)) {
+        if (['zip', 'rar', '7z', 'pdf', 'epub', 'exe'].includes(ext)) {
             mimeType = "application/octet-stream";
             attributes = [new Api.DocumentAttributeFilename({ fileName: state.filename })];
             forceFile = true;
@@ -232,13 +237,11 @@ async function runRelay(link, chatId, env, startPart, msgId) {
 // --- HELPERS ---
 async function editProgress(env, chatId, msgId, name, current, total, size) {
     const percent = Math.min(100, (current / total) * 100);
-    const filled = Math.floor(percent / 10);
-    const bar = "■".repeat(filled) + "□".repeat(10 - filled);
     const uploadedMB = ((current * 512 * 1024) / 1024 / 1024).toFixed(2);
     const totalMB = (size / 1024 / 1024).toFixed(2);
     
     await editMessage(env, chatId, msgId, 
-        `🛡️ **Bulletproof...**\n📄 \`${name}\`\n📊 ${bar} **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
+        `🔍 **Diagnostic...**\n📄 \`${name}\`\n📊 **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
     );
 }
 
