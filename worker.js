@@ -1,8 +1,8 @@
 /**
- * CLOUDFLARE LEECH BOT (SHORT BURST EDITION)
- * - STRATEGY: Uploads exactly 5MB (10 chunks) then forces a relay.
- * - GOAL: Prevents Cloudflare CPU Timeouts completely.
- * - STATUS: Unkillable.
+ * CLOUDFLARE LEECH BOT (SHORT BURST FIX)
+ * - Fixed Variable Name Typo.
+ * - Uploads 10 chunks (5MB) per run.
+ * - Status: Unkillable.
  */
 
 import { Api, TelegramClient } from "telegram";
@@ -91,12 +91,10 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         const CHUNK_SIZE = 512 * 1024;
         const byteStart = startPart * CHUNK_SIZE;
         
-        // Only fetch what we need for this "Burst" to save memory
-        // We fetch a bit more than needed to be safe, but not the whole file if huge
         const response = await fetch(link, { 
             headers: { 
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-                "Range": `bytes=${byteStart}-`, // Cloudflare will handle the stream
+                "Range": `bytes=${byteStart}-`,
                 "Accept": "*/*"
             } 
         });
@@ -110,11 +108,9 @@ async function runRelay(link, chatId, env, startPart, msgId) {
 
         // LOOP
         while (true) {
-            // --- SAFETY CHECK: Force Relay after N chunks ---
-            if (chunksProcessed >= CHUNK_PER_RUN) {
-                // We did our job. Pass the baton.
+            // --- SAFETY CHECK: Force Relay after 10 chunks ---
+            if (chunksProcessed >= CHUNKS_PER_RUN) { // FIXED VARIABLE HERE
                 await triggerNextWorker(env, link, chatId, partIdx, msgId);
-                // Update UI before dying
                 await editProgress(env, chatId, msgId, state.filename, partIdx, state.totalParts, state.totalSize);
                 return; 
             }
@@ -144,7 +140,7 @@ async function runRelay(link, chatId, env, startPart, msgId) {
                 }));
 
                 partIdx++;
-                chunksProcessed++; // Count +1
+                chunksProcessed++;
                 
                 if (buffer.length === 0 && done) break;
             }
@@ -152,7 +148,7 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             if (done && buffer.length === 0) break;
         }
 
-        // --- FINISH (If loop ended naturally) ---
+        // --- FINISH ---
         await editMessage(env, chatId, msgId, "✅ **100%!** Sending...");
 
         const ext = state.filename.split('.').pop().toLowerCase();
@@ -195,7 +191,6 @@ async function editProgress(env, chatId, msgId, name, current, total, size) {
     const uploadedMB = ((current * 512 * 1024) / 1024 / 1024).toFixed(2);
     const totalMB = (size / 1024 / 1024).toFixed(2);
     
-    // Simple Text to save regex CPU
     await editMessage(env, chatId, msgId, 
         `🏃 **Burst Mode...**\n📄 \`${name}\`\n📊 **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
     );
