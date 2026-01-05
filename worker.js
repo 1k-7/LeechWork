@@ -1,27 +1,26 @@
 /**
- * CLOUDFLARE LEECH BOT (VERBOSE RELAY)
- * - DEBUGGING: Shows exactly why the "Handoff" fails.
- * - BURST: 10 Chunks per run (5MB).
- * - RETRY: If relay fails, it pauses and tries again.
+ * CLOUDFLARE LEECH BOT (AUTO-DETECT EDITION)
+ * - REMOVED NEED FOR 'WORKER_URL': Bot finds itself automatically.
+ * - FIXES: 404 Relay Errors.
+ * - MODE: Burst (10 chunks/run) for safety.
  */
 
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { Buffer } from "node:buffer";
 
-// SAFETY LIMIT: 5MB per burst
 const CHUNKS_PER_RUN = 10; 
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const workerOrigin = url.origin; // e.g. https://leech-bot.user.workers.dev
 
     // --- ROUTE 1: BOT SIDE ---
     if (request.method === "POST" && !url.searchParams.has("resume")) {
       try {
         const update = await request.json();
 
-        // RELAY HANDLER
         if (update.message && (update.message.document || update.message.video || update.message.audio)) {
             const caption = update.message.caption;
             if (caption && /^-?\d+$/.test(caption)) {
@@ -30,21 +29,18 @@ export default {
             }
         }
 
-        // COMMAND HANDLER
         if (update.message && update.message.text && update.message.text.startsWith("/leech")) {
             const chatId = update.message.chat.id;
             const link = update.message.text.split(/\s+/)[1];
             if (!link) return sendMessage(env, chatId, "❌ Usage: `/leech <link>`");
 
-            // VALIDATE CONFIG
             if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ Error: `LEECH_DB` is missing.");
-            if (!env.WORKER_URL) return sendMessage(env, chatId, "❌ Error: `WORKER_URL` is missing.");
-            if (!env.WORKER_URL.startsWith("http")) return sendMessage(env, chatId, "❌ Error: `WORKER_URL` must start with http/https.");
 
-            const statusMsg = await sendMessage(env, chatId, "🏃 **Sprint 1 Started...**");
+            const statusMsg = await sendMessage(env, chatId, "🏃 **Auto-Detect Sprint Started...**");
             const msgId = statusMsg.result.message_id;
 
-            ctx.waitUntil(runRelay(link, chatId, env, 0, msgId));
+            // PASS 'workerOrigin' to the relay so it knows where to call back
+            ctx.waitUntil(runRelay(link, chatId, env, 0, msgId, workerOrigin));
             return new Response("OK");
         }
       } catch (e) { return new Response("Error", { status: 200 }); }
@@ -53,7 +49,8 @@ export default {
     // --- ROUTE 2: WORKER SIDE ---
     if (request.method === "POST" && url.searchParams.get("resume") === "true") {
       const payload = await request.json();
-      ctx.waitUntil(runRelay(payload.link, payload.chatId, env, payload.nextPart, payload.msgId));
+      // Pass the origin again to keep the chain alive
+      ctx.waitUntil(runRelay(payload.link, payload.chatId, env, payload.nextPart, payload.msgId, workerOrigin));
       return new Response("Active");
     }
 
@@ -62,7 +59,7 @@ export default {
 };
 
 // --- CORE LOGIC ---
-async function runRelay(link, chatId, env, startPart, msgId) {
+async function runRelay(link, chatId, env, startPart, msgId, workerOrigin) {
     let client;
     try {
         const session = new StringSession(env.SESSION_STRING);
@@ -113,16 +110,14 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         while (true) {
             // --- HANDOFF CHECK ---
             if (chunksProcessed >= CHUNKS_PER_RUN) {
-                // EXPLICIT HANDOFF
-                await editMessage(env, chatId, msgId, `🔄 **Handing off to Part ${partIdx}...**`);
-                
-                const result = await triggerNextWorker(env, link, chatId, partIdx, msgId);
+                // EXPLICIT HANDOFF using Auto-Detected Origin
+                const result = await triggerNextWorker(workerOrigin, link, chatId, partIdx, msgId);
                 
                 if (result.ok) {
                     await editProgress(env, chatId, msgId, state.filename, partIdx, state.totalParts, state.totalSize);
                 } else {
-                    // FATAL ERROR IN RELAY
-                    await editMessage(env, chatId, msgId, `❌ **Relay Failed:** ${result.error}`);
+                    // IF THIS FAILS, IT PRINTS THE URL IT TRIED TO HIT
+                    await editMessage(env, chatId, msgId, `❌ **Relay Failed:**\nTried: ${workerOrigin}\nError: ${result.error}`);
                 }
                 return; 
             }
@@ -138,7 +133,6 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             }
 
             while (buffer.length >= CHUNK_SIZE || (done && buffer.length > 0)) {
-                
                 const currentChunkSize = Math.min(CHUNK_SIZE, buffer.length);
                 const chunk = buffer.slice(0, currentChunkSize);
                 buffer = buffer.slice(currentChunkSize);
@@ -155,7 +149,6 @@ async function runRelay(link, chatId, env, startPart, msgId) {
                 
                 if (buffer.length === 0 && done) break;
             }
-            
             if (done && buffer.length === 0) break;
         }
 
@@ -207,19 +200,19 @@ async function editProgress(env, chatId, msgId, name, current, total, size) {
     );
 }
 
-// --- VERBOSE TRIGGER ---
-async function triggerNextWorker(env, link, chatId, nextPart, msgId) {
-    if (!env.WORKER_URL) return { ok: false, error: "No URL" };
+// --- AUTO-DETECT TRIGGER ---
+async function triggerNextWorker(origin, link, chatId, nextPart, msgId) {
+    // Falls back to env var if origin is missing (unlikely)
+    const targetUrl = origin || "MISSING_URL"; 
     
     try {
-        // We AWAIT this to capture errors
-        const response = await fetch(`${env.WORKER_URL}?resume=true`, {
+        const response = await fetch(`${targetUrl}?resume=true`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ link, chatId, nextPart, msgId })
         });
         
         if (!response.ok) {
-            return { ok: false, error: `HTTP ${response.status} - ${await response.text()}` };
+            return { ok: false, error: `HTTP ${response.status} at ${targetUrl}` };
         }
         return { ok: true };
         
