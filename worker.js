@@ -1,28 +1,37 @@
 /**
- * CLOUDFLARE LEECH BOT (PATH-PERFECT FIX)
- * - Auto-detects FULL URL (including paths) to prevent 404s.
- * - Adds manual WORKER_URL support as backup.
- * - BURST MODE: 10 chunks per run (Stable).
+ * CLOUDFLARE LEECH BOT (SERVICE BINDING EDITION)
+ * - Uses 'env.SELF' to relay.
+ * - Bypasses Public Internet (No 404s).
+ * - Faster & More Reliable.
  */
 
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { Buffer } from "node:buffer";
 
+// BURST LIMIT: 10 Chunks (5MB) per run
 const CHUNKS_PER_RUN = 10; 
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    // CRITICAL FIX: Use the full path, not just the origin
-    const selfUrl = env.WORKER_URL || (url.origin + url.pathname);
 
-    // --- ROUTE 1: BOT SIDE ---
-    if (request.method === "POST" && !url.searchParams.has("resume")) {
+    // --- INTERNAL ROUTE (Service Binding hits this) ---
+    // We use a specific path "/relay" for internal calls
+    if (url.pathname === "/relay" || url.searchParams.get("resume") === "true") {
+      try {
+        const payload = await request.json();
+        ctx.waitUntil(runRelay(payload.link, payload.chatId, env, payload.nextPart, payload.msgId));
+        return new Response("Relay Started");
+      } catch (e) { return new Response("Error", { status: 500 }); }
+    }
+
+    // --- PUBLIC ROUTE (Telegram hits this) ---
+    if (request.method === "POST") {
       try {
         const update = await request.json();
 
-        // RELAY HANDLER
+        // 1. HANDOFF (Userbot -> Bot)
         if (update.message && (update.message.document || update.message.video || update.message.audio)) {
             const caption = update.message.caption;
             if (caption && /^-?\d+$/.test(caption)) {
@@ -31,37 +40,29 @@ export default {
             }
         }
 
-        // COMMANDS
+        // 2. COMMANDS
         if (update.message && update.message.text) {
             const text = update.message.text;
             const chatId = update.message.chat.id;
 
-            // DEBUG COMMAND: /ping
-            if (text === "/ping") {
-                await sendMessage(env, chatId, `🏓 **Pong!**\nSelf-URL detected as:\n\`${selfUrl}\``);
-                return new Response("OK");
-            }
+            if (text === "/ping") return sendMessage(env, chatId, "🏓 **Pong!**\nService Binding: " + (env.SELF ? "✅ Active" : "❌ Missing"));
 
             if (text.startsWith("/leech")) {
                 const link = text.split(/\s+/)[1];
                 if (!link) return sendMessage(env, chatId, "❌ Usage: `/leech <link>`");
                 if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ Error: `LEECH_DB` is missing.");
+                
+                // Check if Service Binding is set up
+                if (!env.SELF) return sendMessage(env, chatId, "❌ **Critical:** `SELF` binding missing in wrangler.toml.");
 
-                const statusMsg = await sendMessage(env, chatId, "🚀 **Path-Perfect Sprint...**");
+                const statusMsg = await sendMessage(env, chatId, "🔗 **Internal Relay Started...**");
                 const msgId = statusMsg.result.message_id;
 
-                ctx.waitUntil(runRelay(link, chatId, env, 0, msgId, selfUrl));
+                ctx.waitUntil(runRelay(link, chatId, env, 0, msgId));
                 return new Response("OK");
             }
         }
       } catch (e) { return new Response("Error", { status: 200 }); }
-    }
-
-    // --- ROUTE 2: WORKER SIDE ---
-    if (request.method === "POST" && url.searchParams.get("resume") === "true") {
-      const payload = await request.json();
-      ctx.waitUntil(runRelay(payload.link, payload.chatId, env, payload.nextPart, payload.msgId, selfUrl));
-      return new Response("Active");
     }
 
     return new Response("Active");
@@ -69,7 +70,7 @@ export default {
 };
 
 // --- CORE LOGIC ---
-async function runRelay(link, chatId, env, startPart, msgId, selfUrl) {
+async function runRelay(link, chatId, env, startPart, msgId) {
     let client;
     try {
         const session = new StringSession(env.SESSION_STRING);
@@ -116,17 +117,16 @@ async function runRelay(link, chatId, env, startPart, msgId, selfUrl) {
         let buffer = new Uint8Array(0);
         let chunksProcessed = 0;
 
-        // LOOP
+        // UPLOAD LOOP
         while (true) {
-            // --- HANDOFF CHECK ---
+            // --- HANDOFF via SERVICE BINDING ---
             if (chunksProcessed >= CHUNKS_PER_RUN) {
-                // EXPLICIT HANDOFF
-                const result = await triggerNextWorker(selfUrl, link, chatId, partIdx, msgId);
+                const result = await triggerNextWorker(env, link, chatId, partIdx, msgId);
                 
                 if (result.ok) {
                     await editProgress(env, chatId, msgId, state.filename, partIdx, state.totalParts, state.totalSize);
                 } else {
-                    await editMessage(env, chatId, msgId, `❌ **Relay Failed:**\nTried: ${selfUrl}\nError: ${result.error}`);
+                    await editMessage(env, chatId, msgId, `❌ **Relay Failed:** ${result.error}`);
                 }
                 return; 
             }
@@ -155,7 +155,6 @@ async function runRelay(link, chatId, env, startPart, msgId, selfUrl) {
 
                 partIdx++;
                 chunksProcessed++;
-                
                 if (buffer.length === 0 && done) break;
             }
             if (done && buffer.length === 0) break;
@@ -205,20 +204,24 @@ async function editProgress(env, chatId, msgId, name, current, total, size) {
     const totalMB = (size / 1024 / 1024).toFixed(2);
     
     await editMessage(env, chatId, msgId, 
-        `🏃 **Burst Mode...**\n📄 \`${name}\`\n📊 **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
+        `🔗 **Internal Relay...**\n📄 \`${name}\`\n📊 **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
     );
 }
 
-// --- TRIGGER USING EXACT SELF-URL ---
-async function triggerNextWorker(targetUrl, link, chatId, nextPart, msgId) {
+// --- TRIGGER USING SERVICE BINDING (NO 404s) ---
+async function triggerNextWorker(env, link, chatId, nextPart, msgId) {
+    if (!env.SELF) return { ok: false, error: "SELF binding missing" };
+    
     try {
-        const response = await fetch(`${targetUrl}?resume=true`, {
+        // We use a dummy URL "http://internal/relay" - The name doesn't matter for Service Bindings
+        // but the path "/relay" triggers the logic at the top of fetch()
+        const response = await env.SELF.fetch("http://internal/relay", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ link, chatId, nextPart, msgId })
         });
         
         if (!response.ok) {
-            return { ok: false, error: `HTTP ${response.status}` };
+            return { ok: false, error: `Internal Error ${response.status}` };
         }
         return { ok: true };
         
