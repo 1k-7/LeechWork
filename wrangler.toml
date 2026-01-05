@@ -3,7 +3,13 @@ main = "worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Your Database Binding (Keep this!)
+# 1. DATABASE CONNECTION
 [[kv_namespaces]]
 binding = "LEECH_DB"
 id = "13fbf5261f684cb5b7f8b60df34826e2"
+
+# 2. SELF-BINDING (The Fix for 404)
+# This allows the worker to call 'env.SELF' internally
+[[services]]
+binding = "SELF"
+service = "leework"
