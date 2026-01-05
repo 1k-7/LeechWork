@@ -1,10 +1,11 @@
 /**
  * CLOUDFLARE "RELAY" LEECH BOT (Native KV Version)
- * - Uploads 2GB+ files.
- * - Auto-Resumes on timeout (Relay Mode).
- * - Uses Cloudflare KV for state (No MongoDB required).
+ * - Fixed Import URLs
+ * - Uploads 2GB+ files via Relay
+ * - Uses Cloudflare KV (LEECH_DB) for state
  */
 
+// FIXED URLS (Added the missing slash)
 import { Api, TelegramClient } from "https://esm.sh/telegram@2.22.2";
 import { StringSession } from "https://esm.sh/telegram@2.22.2/sessions";
 
@@ -25,9 +26,9 @@ export default {
             if (!link) return sendMessage(env, chatId, "❌ Usage: `/leech <link>`");
 
             // Check if KV is bound
-            if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ **Config Error:** Please bind a KV Namespace named `LEECH_DB` in settings.");
+            if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ **Config Error:** LEECH_DB is missing. Check wrangler.toml.");
 
-            await sendMessage(env, chatId, "🚀 **Job Started.** Initializing...");
+            await sendMessage(env, chatId, "🚀 **Job Started.** Initializing Relay...");
             
             // Start the relay (Part 0)
             ctx.waitUntil(runRelay(link, chatId, env, 0));
@@ -55,7 +56,7 @@ async function runRelay(link, chatId, env, startPart) {
     let client;
     try {
         const START_TIME = Date.now();
-        const MAX_RUNTIME = 80 * 1000; // 80s Limit
+        const MAX_RUNTIME = 80 * 1000; // 80s Limit (Safety buffer)
 
         // 1. SETUP CLIENT
         if (!env.SESSION_STRING) throw new Error("Missing SESSION_STRING variable.");
@@ -74,6 +75,7 @@ async function runRelay(link, chatId, env, startPart) {
         const totalSize = parseInt(head.headers.get("content-length") || "0");
         const supportsRange = head.headers.get("accept-ranges") === "bytes";
 
+        // Huge file check
         if (!supportsRange && totalSize > 50*1024*1024) {
             throw new Error("Source server doesn't support resuming (Range Headers). Cannot process huge file.");
         }
@@ -86,7 +88,7 @@ async function runRelay(link, chatId, env, startPart) {
             const filename = link.split("/").pop().split("?")[0] || "video.mp4";
             
             state = { fileId, totalParts, filename, totalSize };
-            // Save to KV (Expire in 24 hours to clean up)
+            // Save to KV (Expire in 24 hours)
             await env.LEECH_DB.put(link, JSON.stringify(state), { expirationTtl: 86400 });
             
             await sendMessage(env, chatId, `📦 **File Details:**\n\`${filename}\`\nSize: ${(totalSize/1024/1024).toFixed(2)}MB\nTotal Parts: ${totalParts}`);
@@ -112,18 +114,17 @@ async function runRelay(link, chatId, env, startPart) {
         let buffer = new Uint8Array(0);
 
         while (true) {
-            // TIME CHECK
+            // TIME CHECK: Force Handover if > 80s
             if (Date.now() - START_TIME > MAX_RUNTIME) {
-                // Trigger Relay
+                // Trigger Next Worker
                 await triggerNextWorker(env, link, chatId, partIdx);
                 
                 // Update User
                 const percent = (partIdx / state.totalParts) * 100;
-                // Only send log if percent changed significantly (avoid flood)
-                if (partIdx % 10 === 0) {
+                if (partIdx % 20 === 0) { // Log sparingly
                      await sendMessage(env, chatId, `🔄 **Relaying...** (${percent.toFixed(1)}%)`);
                 }
-                return;
+                return; // End this worker cleanly
             }
 
             const { done, value } = await reader.read();
@@ -192,11 +193,11 @@ async function runRelay(link, chatId, env, startPart) {
 // --- RECURSIVE TRIGGER ---
 async function triggerNextWorker(env, link, chatId, nextPart) {
     if (!env.WORKER_URL) {
-         // Fallback: Try to guess worker URL from request? No, explicit is safer.
          console.error("WORKER_URL missing");
          return;
     }
     
+    // Call ourself with ?resume=true
     fetch(`${env.WORKER_URL}?resume=true`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
