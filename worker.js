@@ -5,9 +5,9 @@
  * - Uses Cloudflare KV (LEECH_DB) for state
  */
 
-// FIXED URLS:
-import { Api, TelegramClient } from "https://esm.sh/telegram@2.22.2";
-import { StringSession } from "https://esm.sh/telegram@2.22.2/sessions";
+// FORCE UPDATE: v2
+import { Api, TelegramClient } from "https://esm.sh/telegram@2.22.2?cache=bust";
+import { StringSession } from "https://esm.sh/telegram@2.22.2/sessions?cache=bust";
 
 export default {
   async fetch(request, env, ctx) {
