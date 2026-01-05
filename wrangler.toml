@@ -1,10 +1,9 @@
 name = "leework"
 main = "worker.js"
-compatibility_date = "2024-01-01"
-
-# ENABLE NODE.JS COMPATIBILITY (Fixes 'fs', 'net', 'crypto' errors)
+compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+# Your Database Binding (Keep this!)
 [[kv_namespaces]]
 binding = "LEECH_DB"
 id = "13fbf5261f684cb5b7f8b60df34826e2"
