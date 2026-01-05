@@ -1,15 +1,16 @@
 /**
- * CLOUDFLARE LEECH BOT (FINAL POLISH)
- * - FIX: /ping loop (Returns correct HTTP 200).
- * - FIX: Stream Hang (Added 'Accept-Encoding: identity').
- * - FEATURE: Service Binding (No 404s).
+ * CLOUDFLARE LEECH BOT (HEAVY LIFTER)
+ * - SPRINT SIZE: 25MB (Reduces relays by 5x).
+ * - DEBUGGING: Worker B announces itself immediately.
+ * - PROTECTION: Checks if Source Server ignores "Range" headers.
  */
 
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { Buffer } from "node:buffer";
 
-const CHUNKS_PER_RUN = 10; 
+// SPRINT SIZE: 50 Chunks = 25MB (Fits easily in 30s CPU time)
+const CHUNKS_PER_RUN = 50; 
 
 export default {
   async fetch(request, env, ctx) {
@@ -19,8 +20,10 @@ export default {
     if (url.pathname === "/relay" || url.searchParams.get("resume") === "true") {
       try {
         const payload = await request.json();
+        // Respond immediately so Worker A knows we got the message
+        const response = new Response("Relay Started");
         ctx.waitUntil(runRelay(payload.link, payload.chatId, env, payload.nextPart, payload.msgId));
-        return new Response("Relay Started");
+        return response;
       } catch (e) { return new Response("Error", { status: 500 }); }
     }
 
@@ -29,7 +32,7 @@ export default {
       try {
         const update = await request.json();
 
-        // 1. HANDOFF (Userbot -> Bot)
+        // HANDOFF
         if (update.message && (update.message.document || update.message.video || update.message.audio)) {
             const caption = update.message.caption;
             if (caption && /^-?\d+$/.test(caption)) {
@@ -38,15 +41,14 @@ export default {
             }
         }
 
-        // 2. COMMANDS
+        // COMMANDS
         if (update.message && update.message.text) {
             const text = update.message.text;
             const chatId = update.message.chat.id;
 
-            // FIX: PING COMMAND MUST RETURN RESPONSE "OK"
             if (text === "/ping") {
                 await sendMessage(env, chatId, "🏓 **Pong!**\nService Binding: " + (env.SELF ? "✅ Active" : "❌ Missing"));
-                return new Response("OK"); // <--- THIS STOPS THE SPAM
+                return new Response("OK");
             }
 
             if (text.startsWith("/leech")) {
@@ -55,7 +57,7 @@ export default {
                 if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ Error: `LEECH_DB` is missing.");
                 if (!env.SELF) return sendMessage(env, chatId, "❌ **Critical:** `SELF` binding missing in wrangler.toml.");
 
-                const statusMsg = await sendMessage(env, chatId, "🔗 **Internal Relay Started...**");
+                const statusMsg = await sendMessage(env, chatId, "🚀 **Heavy Lifter Started...**");
                 const msgId = statusMsg.result.message_id;
 
                 ctx.waitUntil(runRelay(link, chatId, env, 0, msgId));
@@ -76,7 +78,9 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         const START_TIME = Date.now();
         const MAX_RUNTIME = 50 * 1000;
 
-        if (startPart === 0) await editMessage(env, chatId, msgId, "🔑 **Logging in...**");
+        // DIAGNOSTIC: Confirm Relay Start
+        if (startPart > 0) await editMessage(env, chatId, msgId, `♻️ **Relay Connected! (Part ${startPart})**`);
+        else await editMessage(env, chatId, msgId, "🔑 **Logging in...**");
 
         const session = new StringSession(env.SESSION_STRING);
         client = new TelegramClient(session, parseInt(env.API_ID), env.API_HASH, { connectionRetries: 1, useWSS: true });
@@ -88,12 +92,11 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         if (startPart === 0 || !state) {
             await editMessage(env, chatId, msgId, "📡 **Fetching Headers...**");
 
-            // HEAD REQUEST
             const head = await fetch(link, { 
                 method: "HEAD", 
                 headers: { 
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept-Encoding": "identity" // Force RAW bytes
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept-Encoding": "identity"
                 } 
             });
             
@@ -116,33 +119,38 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             await env.LEECH_DB.put(link, JSON.stringify(state), { expirationTtl: 86400 });
         }
 
+        // CRITICAL CHECK: If relaying, ensure we have state
+        if (startPart > 0 && !state) throw new Error("CRITICAL: Lost download state during relay.");
+
         const CHUNK_SIZE = 512 * 1024;
         const byteStart = startPart * CHUNK_SIZE;
 
         if (startPart === 0) await editMessage(env, chatId, msgId, "⬇️ **Starting Stream...**");
         
-        // GET REQUEST (Stream)
-        // Added AbortController to kill hangs after 10s
+        // STREAM REQUEST
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10000);
+        const timeout = setTimeout(() => controller.abort(), 15000); // 15s Timeout
 
         let response;
         try {
             response = await fetch(link, { 
                 headers: { 
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
                     "Range": `bytes=${byteStart}-`,
                     "Accept": "*/*",
-                    "Accept-Encoding": "identity" // CRITICAL FIX
+                    "Accept-Encoding": "identity"
                 },
                 signal: controller.signal
             });
             clearTimeout(timeout);
-        } catch (e) {
-            throw new Error("Stream Connection Timed Out");
-        }
+        } catch (e) { throw new Error("Stream Connection Timed Out"); }
 
         if (!response.ok) throw new Error(`Stream HTTP ${response.status}`);
+        
+        // SAFETY: Check if server ignored Range header
+        if (response.status === 200 && startPart > 0) {
+            throw new Error("Source Server does not support Resuming (Ignored Range Header). Cannot Relay.");
+        }
 
         const reader = response.body.getReader();
         let partIdx = startPart;
@@ -152,13 +160,13 @@ async function runRelay(link, chatId, env, startPart, msgId) {
 
         // LOOP
         while (true) {
-            // Check Timeout
+            // TIMEOUT CHECK
             if (Date.now() - START_TIME > MAX_RUNTIME) {
                 await triggerNextWorker(env, link, chatId, partIdx, msgId);
                 return;
             }
 
-            // Burst Check
+            // BURST CHECK (50 Chunks = 25MB)
             if (chunksProcessed >= CHUNKS_PER_RUN) {
                 const result = await triggerNextWorker(env, link, chatId, partIdx, msgId);
                 if (result.ok) {
@@ -248,7 +256,7 @@ async function editProgress(env, chatId, msgId, name, current, total, size) {
     const totalMB = (size / 1024 / 1024).toFixed(2);
     
     await editMessage(env, chatId, msgId, 
-        `🔗 **Internal Relay...**\n📄 \`${name}\`\n📊 **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
+        `🏋️ **Heavy Lifter...**\n📄 \`${name}\`\n📊 **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
     );
 }
 
