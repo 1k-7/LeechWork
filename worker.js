@@ -1,11 +1,11 @@
 /**
  * CLOUDFLARE "RELAY" LEECH BOT (Native KV Version)
- * - Fixed Import URLs
+ * - Fixed Import URLs (Double Slash)
  * - Uploads 2GB+ files via Relay
  * - Uses Cloudflare KV (LEECH_DB) for state
  */
 
-// FIXED URLS (Added the missing slash)
+// FIXED URLS:
 import { Api, TelegramClient } from "https://esm.sh/telegram@2.22.2";
 import { StringSession } from "https://esm.sh/telegram@2.22.2/sessions";
 
