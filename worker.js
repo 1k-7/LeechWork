@@ -1,15 +1,15 @@
 /**
- * CLOUDFLARE LEECH BOT (SHORT BURST FIX)
- * - Fixed Variable Name Typo.
- * - Uploads 10 chunks (5MB) per run.
- * - Status: Unkillable.
+ * CLOUDFLARE LEECH BOT (VERBOSE RELAY)
+ * - DEBUGGING: Shows exactly why the "Handoff" fails.
+ * - BURST: 10 Chunks per run (5MB).
+ * - RETRY: If relay fails, it pauses and tries again.
  */
 
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { Buffer } from "node:buffer";
 
-// SAFETY LIMIT: Only process this many parts per run
+// SAFETY LIMIT: 5MB per burst
 const CHUNKS_PER_RUN = 10; 
 
 export default {
@@ -21,6 +21,7 @@ export default {
       try {
         const update = await request.json();
 
+        // RELAY HANDLER
         if (update.message && (update.message.document || update.message.video || update.message.audio)) {
             const caption = update.message.caption;
             if (caption && /^-?\d+$/.test(caption)) {
@@ -29,14 +30,18 @@ export default {
             }
         }
 
+        // COMMAND HANDLER
         if (update.message && update.message.text && update.message.text.startsWith("/leech")) {
             const chatId = update.message.chat.id;
             const link = update.message.text.split(/\s+/)[1];
             if (!link) return sendMessage(env, chatId, "❌ Usage: `/leech <link>`");
 
-            if (!env.LEECH_DB || !env.WORKER_URL) return sendMessage(env, chatId, "❌ Error: Config missing.");
+            // VALIDATE CONFIG
+            if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ Error: `LEECH_DB` is missing.");
+            if (!env.WORKER_URL) return sendMessage(env, chatId, "❌ Error: `WORKER_URL` is missing.");
+            if (!env.WORKER_URL.startsWith("http")) return sendMessage(env, chatId, "❌ Error: `WORKER_URL` must start with http/https.");
 
-            const statusMsg = await sendMessage(env, chatId, "🏃 **Starting Sprint 1...**");
+            const statusMsg = await sendMessage(env, chatId, "🏃 **Sprint 1 Started...**");
             const msgId = statusMsg.result.message_id;
 
             ctx.waitUntil(runRelay(link, chatId, env, 0, msgId));
@@ -60,14 +65,13 @@ export default {
 async function runRelay(link, chatId, env, startPart, msgId) {
     let client;
     try {
-        // LOGIN
         const session = new StringSession(env.SESSION_STRING);
         client = new TelegramClient(session, parseInt(env.API_ID), env.API_HASH, { connectionRetries: 1, useWSS: true });
         await client.connect();
 
-        // METADATA
         let state = await env.LEECH_DB.get(link, { type: "json" });
         
+        // INIT STATE
         if (startPart === 0 || !state) {
             const head = await fetch(link, { method: "HEAD", headers: { "User-Agent": "Mozilla/5.0" } });
             const totalSize = parseInt(head.headers.get("content-length") || "0");
@@ -87,7 +91,6 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             await env.LEECH_DB.put(link, JSON.stringify(state), { expirationTtl: 86400 });
         }
 
-        // CALCULATE RANGE
         const CHUNK_SIZE = 512 * 1024;
         const byteStart = startPart * CHUNK_SIZE;
         
@@ -104,14 +107,23 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         const reader = response.body.getReader();
         let partIdx = startPart;
         let buffer = new Uint8Array(0);
-        let chunksProcessed = 0; // Counter for this sprint
+        let chunksProcessed = 0;
 
         // LOOP
         while (true) {
-            // --- SAFETY CHECK: Force Relay after 10 chunks ---
-            if (chunksProcessed >= CHUNKS_PER_RUN) { // FIXED VARIABLE HERE
-                await triggerNextWorker(env, link, chatId, partIdx, msgId);
-                await editProgress(env, chatId, msgId, state.filename, partIdx, state.totalParts, state.totalSize);
+            // --- HANDOFF CHECK ---
+            if (chunksProcessed >= CHUNKS_PER_RUN) {
+                // EXPLICIT HANDOFF
+                await editMessage(env, chatId, msgId, `🔄 **Handing off to Part ${partIdx}...**`);
+                
+                const result = await triggerNextWorker(env, link, chatId, partIdx, msgId);
+                
+                if (result.ok) {
+                    await editProgress(env, chatId, msgId, state.filename, partIdx, state.totalParts, state.totalSize);
+                } else {
+                    // FATAL ERROR IN RELAY
+                    await editMessage(env, chatId, msgId, `❌ **Relay Failed:** ${result.error}`);
+                }
                 return; 
             }
 
@@ -131,7 +143,6 @@ async function runRelay(link, chatId, env, startPart, msgId) {
                 const chunk = buffer.slice(0, currentChunkSize);
                 buffer = buffer.slice(currentChunkSize);
 
-                // Upload
                 await client.invoke(new Api.upload.SaveBigFilePart({
                     fileId: BigInt(state.fileId),
                     filePart: partIdx,
@@ -196,14 +207,25 @@ async function editProgress(env, chatId, msgId, name, current, total, size) {
     );
 }
 
+// --- VERBOSE TRIGGER ---
 async function triggerNextWorker(env, link, chatId, nextPart, msgId) {
-    if (!env.WORKER_URL) return;
+    if (!env.WORKER_URL) return { ok: false, error: "No URL" };
+    
     try {
-        await fetch(`${env.WORKER_URL}?resume=true`, {
+        // We AWAIT this to capture errors
+        const response = await fetch(`${env.WORKER_URL}?resume=true`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ link, chatId, nextPart, msgId })
         });
-    } catch(e) {}
+        
+        if (!response.ok) {
+            return { ok: false, error: `HTTP ${response.status} - ${await response.text()}` };
+        }
+        return { ok: true };
+        
+    } catch(e) {
+        return { ok: false, error: e.message };
+    }
 }
 
 async function sendMessage(env, chatId, text) {
