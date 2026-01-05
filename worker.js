@@ -1,22 +1,41 @@
 /**
- * CLOUDFLARE "RELAY" LEECH BOT (Buffer Fix)
- * - Fixed "Bytes expected" error by forcing Buffer type
- * - Uploads 2GB+ files via Relay
- * - Uses Cloudflare KV (LEECH_DB)
+ * CLOUDFLARE LEECH BOT (Dynamic Triangle)
+ * 1. Userbot uploads file.
+ * 2. Userbot AUTO-FETCHES Bot Username -> Sends file to Bot.
+ * 3. Bot copies file to User.
+ * - NO BOT_USERNAME variable needed.
+ * - Solves "Entity Not Found" & "Bytes/Buffer" errors.
  */
 
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
-import { Buffer } from "node:buffer"; // IMPORT BUFFER
+import { Buffer } from "node:buffer"; 
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // --- ROUTE 1: TELEGRAM COMMANDS ---
+    // --- ROUTE 1: TELEGRAM WEBHOOK (The "Bot" Side) ---
     if (request.method === "POST" && !url.searchParams.has("resume")) {
       try {
         const update = await request.json();
+        
+        // A. THE HANDOFF (Bot receives file from Userbot)
+        if (update.message && (update.message.document || update.message.video)) {
+            const caption = update.message.caption;
+            // If caption is a Chat ID (numbers), it means "Send this to user"
+            if (caption && /^-?\d+$/.test(caption)) {
+                const targetChatId = caption;
+                const msgId = update.message.message_id;
+                const fromChatId = update.message.chat.id;
+
+                // Copy the file to the user (Clean delivery)
+                await copyMessage(env, fromChatId, msgId, targetChatId);
+                return new Response("Relayed");
+            }
+        }
+
+        // B. USER COMMANDS (/leech)
         if (update.message && update.message.text) {
           const text = update.message.text;
           const chatId = update.message.chat.id;
@@ -25,9 +44,11 @@ export default {
             const link = text.split(/\s+/)[1];
             if (!link) return sendMessage(env, chatId, "❌ Usage: `/leech <link>`");
 
-            if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ **Config Error:** LEECH_DB is missing.");
+            // Config Checks
+            if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ **Config Error:** `LEECH_DB` is missing.");
+            if (!env.WORKER_URL) return sendMessage(env, chatId, "❌ **Config Error:** `WORKER_URL` is missing.");
 
-            await sendMessage(env, chatId, "🚀 **Job Started.** Initializing Relay...");
+            await sendMessage(env, chatId, "🚀 **Job Started.** Initializing...");
             
             ctx.waitUntil(runRelay(link, chatId, env, 0));
             return new Response("OK");
@@ -38,7 +59,7 @@ export default {
       }
     }
 
-    // --- ROUTE 2: RELAY RUNNER (Internal) ---
+    // --- ROUTE 2: RELAY RUNNER (The "Userbot" Side) ---
     if (request.method === "POST" && url.searchParams.get("resume") === "true") {
       const payload = await request.json();
       ctx.waitUntil(runRelay(payload.link, payload.chatId, env, payload.nextPart));
@@ -49,23 +70,21 @@ export default {
   }
 };
 
-// --- MAIN RELAY LOGIC ---
+// --- MAIN LOGIC ---
 async function runRelay(link, chatId, env, startPart) {
     let client;
     try {
         const START_TIME = Date.now();
-        const MAX_RUNTIME = 80 * 1000; 
+        const MAX_RUNTIME = 60 * 1000; // 60s Safety Cutoff
 
-        // 1. SETUP CLIENT
-        if (!env.SESSION_STRING) throw new Error("Missing SESSION_STRING variable.");
-        
+        // 1. SETUP USERBOT
         const session = new StringSession(env.SESSION_STRING);
         client = new TelegramClient(session, parseInt(env.API_ID), env.API_HASH, {
             connectionRetries: 1, useWSS: true
         });
         await client.connect();
 
-        // 2. GET STATE FROM KV
+        // 2. STATE MANAGEMENT
         let state = await env.LEECH_DB.get(link, { type: "json" });
         
         // Fetch Source Info
@@ -73,11 +92,8 @@ async function runRelay(link, chatId, env, startPart) {
         const totalSize = parseInt(head.headers.get("content-length") || "0");
         const supportsRange = head.headers.get("accept-ranges") === "bytes";
 
-        if (!supportsRange && totalSize > 50*1024*1024) {
-            throw new Error("Source server doesn't support resuming (Range Headers). Cannot process huge file.");
-        }
+        if (!supportsRange && totalSize > 50*1024*1024) throw new Error("Source server doesn't support resuming.");
 
-        // Initialize State if new
         if (startPart === 0 || !state) {
             const fileId = BigInt(Math.floor(Math.random() * 1000000000000)).toString();
             const CHUNK_SIZE = 512 * 1024;
@@ -87,34 +103,31 @@ async function runRelay(link, chatId, env, startPart) {
             state = { fileId, totalParts, filename, totalSize };
             await env.LEECH_DB.put(link, JSON.stringify(state), { expirationTtl: 86400 });
             
-            await sendMessage(env, chatId, `📦 **File Details:**\n\`${filename}\`\nSize: ${(totalSize/1024/1024).toFixed(2)}MB\nTotal Parts: ${totalParts}`);
+            await sendMessage(env, chatId, `📦 **File:** \`${filename}\`\n🔢 **Parts:** ${totalParts}`);
         }
 
-        // 3. CALCULATE OFFSETS
+        // 3. STREAM & UPLOAD
         const CHUNK_SIZE = 512 * 1024;
         const byteStart = startPart * CHUNK_SIZE;
         
-        // 4. FETCH SOURCE STREAM
         const response = await fetch(link, {
-            headers: { 
-                "User-Agent": "Mozilla/5.0",
-                "Range": `bytes=${byteStart}-` 
-            }
+            headers: { "User-Agent": "Mozilla/5.0", "Range": `bytes=${byteStart}-` }
         });
 
-        if (!response.ok && response.status !== 206) throw new Error("Stream connection failed.");
+        if (!response.ok && response.status !== 206) throw new Error("Stream Connection Failed");
 
-        // 5. UPLOAD LOOP
         const reader = response.body.getReader();
         let partIdx = startPart;
         let buffer = new Uint8Array(0);
 
         while (true) {
-            // TIME CHECK
+            // RELAY CHECK
             if (Date.now() - START_TIME > MAX_RUNTIME) {
                 await triggerNextWorker(env, link, chatId, partIdx);
-                const percent = (partIdx / state.totalParts) * 100;
-                if (partIdx % 20 === 0) await sendMessage(env, chatId, `🔄 **Relaying...** (${percent.toFixed(1)}%)`);
+                // Only log every 10% to avoid flooding
+                if (partIdx % Math.max(1, Math.floor(state.totalParts / 10)) === 0) {
+                     await sendMessage(env, chatId, `🔄 **Relaying...** ${(partIdx/state.totalParts*100).toFixed(0)}%`);
+                }
                 return;
             }
 
@@ -130,33 +143,38 @@ async function runRelay(link, chatId, env, startPart) {
                 const chunk = buffer.slice(0, CHUNK_SIZE);
                 buffer = buffer.slice(CHUNK_SIZE);
 
-                // --- FIX APPLIED HERE: Buffer.from() ---
                 await client.invoke(new Api.upload.SaveBigFilePart({
                     fileId: BigInt(state.fileId),
                     filePart: partIdx,
                     fileTotalParts: state.totalParts,
-                    bytes: Buffer.from(chunk) // WRAP IN BUFFER
+                    bytes: Buffer.from(chunk) // Buffer Fix
                 }));
                 partIdx++;
             }
         }
 
-        // Flush Buffer
         if (buffer.length > 0) {
-             // --- FIX APPLIED HERE: Buffer.from() ---
              await client.invoke(new Api.upload.SaveBigFilePart({
                 fileId: BigInt(state.fileId),
                 filePart: partIdx,
                 fileTotalParts: state.totalParts,
-                bytes: Buffer.from(buffer) // WRAP IN BUFFER
+                bytes: Buffer.from(buffer)
             }));
         }
 
-        // 6. FINALIZE
-        await sendMessage(env, chatId, "✅ **Upload 100%!** Finalizing...");
+        // 4. FINALIZE: AUTO-DETECT BOT & SEND
+        await sendMessage(env, chatId, "✅ **Upload Done!** Forwarding to you...");
+        
+        // A. Who is the Bot? (Auto-Fetch)
+        const meRes = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getMe`);
+        const meData = await meRes.json();
+        const botUsername = meData.result.username; // Automatically retrieved
+
+        // B. Send file to the Bot
+        const botEntity = await client.getEntity(botUsername);
         
         await client.invoke(new Api.messages.SendMedia({
-            peer: chatId,
+            peer: botEntity,
             media: new Api.InputMediaUploadedDocument({
                 file: new Api.InputFileBig({
                     id: BigInt(state.fileId),
@@ -164,11 +182,9 @@ async function runRelay(link, chatId, env, startPart) {
                     name: state.filename
                 }),
                 mimeType: "video/mp4",
-                attributes: [new Api.DocumentAttributeVideo({ 
-                    duration: 0, w: 1280, h: 720, supportsStreaming: true 
-                })]
+                attributes: [new Api.DocumentAttributeVideo({ duration: 0, w: 1280, h: 720, supportsStreaming: true })]
             }),
-            message: `📦 **${state.filename}**`
+            message: chatId.toString() // PASS THE USER ID IN CAPTION
         }));
         
         await env.LEECH_DB.delete(link);
@@ -180,6 +196,8 @@ async function runRelay(link, chatId, env, startPart) {
         if (client) await client.disconnect();
     }
 }
+
+// --- HELPERS ---
 
 async function triggerNextWorker(env, link, chatId, nextPart) {
     if (!env.WORKER_URL) return;
@@ -196,4 +214,18 @@ async function sendMessage(env, chatId, text) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: "Markdown" })
   });
+}
+
+async function copyMessage(env, fromChatId, messageId, targetChatId) {
+    // Copies the message from Userbot DM -> User Chat
+    await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/copyMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            chat_id: targetChatId,
+            from_chat_id: fromChatId,
+            message_id: messageId,
+            caption: "" // Remove the ID caption
+        })
+    });
 }
