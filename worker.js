@@ -1,13 +1,13 @@
 /**
- * CLOUDFLARE "RELAY" LEECH BOT (Bundled Version)
- * - Uses local 'telegram' package (Fixes "No such module" error)
+ * CLOUDFLARE "RELAY" LEECH BOT (Buffer Fix)
+ * - Fixed "Bytes expected" error by forcing Buffer type
  * - Uploads 2GB+ files via Relay
- * - Uses Cloudflare KV (LEECH_DB) for state
+ * - Uses Cloudflare KV (LEECH_DB)
  */
 
-// STANDARD IMPORTS (No URLs)
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
+import { Buffer } from "node:buffer"; // IMPORT BUFFER
 
 export default {
   async fetch(request, env, ctx) {
@@ -25,12 +25,10 @@ export default {
             const link = text.split(/\s+/)[1];
             if (!link) return sendMessage(env, chatId, "❌ Usage: `/leech <link>`");
 
-            // Check if KV is bound
-            if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ **Config Error:** LEECH_DB is missing. Check wrangler.toml.");
+            if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ **Config Error:** LEECH_DB is missing.");
 
             await sendMessage(env, chatId, "🚀 **Job Started.** Initializing Relay...");
             
-            // Start the relay (Part 0)
             ctx.waitUntil(runRelay(link, chatId, env, 0));
             return new Response("OK");
           }
@@ -56,7 +54,7 @@ async function runRelay(link, chatId, env, startPart) {
     let client;
     try {
         const START_TIME = Date.now();
-        const MAX_RUNTIME = 80 * 1000; // 80s Limit (Safety buffer)
+        const MAX_RUNTIME = 80 * 1000; 
 
         // 1. SETUP CLIENT
         if (!env.SESSION_STRING) throw new Error("Missing SESSION_STRING variable.");
@@ -75,7 +73,6 @@ async function runRelay(link, chatId, env, startPart) {
         const totalSize = parseInt(head.headers.get("content-length") || "0");
         const supportsRange = head.headers.get("accept-ranges") === "bytes";
 
-        // Huge file check
         if (!supportsRange && totalSize > 50*1024*1024) {
             throw new Error("Source server doesn't support resuming (Range Headers). Cannot process huge file.");
         }
@@ -88,7 +85,6 @@ async function runRelay(link, chatId, env, startPart) {
             const filename = link.split("/").pop().split("?")[0] || "video.mp4";
             
             state = { fileId, totalParts, filename, totalSize };
-            // Save to KV (Expire in 24 hours)
             await env.LEECH_DB.put(link, JSON.stringify(state), { expirationTtl: 86400 });
             
             await sendMessage(env, chatId, `📦 **File Details:**\n\`${filename}\`\nSize: ${(totalSize/1024/1024).toFixed(2)}MB\nTotal Parts: ${totalParts}`);
@@ -114,17 +110,12 @@ async function runRelay(link, chatId, env, startPart) {
         let buffer = new Uint8Array(0);
 
         while (true) {
-            // TIME CHECK: Force Handover if > 80s
+            // TIME CHECK
             if (Date.now() - START_TIME > MAX_RUNTIME) {
-                // Trigger Next Worker
                 await triggerNextWorker(env, link, chatId, partIdx);
-                
-                // Update User
                 const percent = (partIdx / state.totalParts) * 100;
-                if (partIdx % 20 === 0) { // Log sparingly
-                     await sendMessage(env, chatId, `🔄 **Relaying...** (${percent.toFixed(1)}%)`);
-                }
-                return; // End this worker cleanly
+                if (partIdx % 20 === 0) await sendMessage(env, chatId, `🔄 **Relaying...** (${percent.toFixed(1)}%)`);
+                return;
             }
 
             const { done, value } = await reader.read();
@@ -139,12 +130,12 @@ async function runRelay(link, chatId, env, startPart) {
                 const chunk = buffer.slice(0, CHUNK_SIZE);
                 buffer = buffer.slice(CHUNK_SIZE);
 
-                // MTProto Upload
+                // --- FIX APPLIED HERE: Buffer.from() ---
                 await client.invoke(new Api.upload.SaveBigFilePart({
                     fileId: BigInt(state.fileId),
                     filePart: partIdx,
                     fileTotalParts: state.totalParts,
-                    bytes: chunk
+                    bytes: Buffer.from(chunk) // WRAP IN BUFFER
                 }));
                 partIdx++;
             }
@@ -152,11 +143,12 @@ async function runRelay(link, chatId, env, startPart) {
 
         // Flush Buffer
         if (buffer.length > 0) {
+             // --- FIX APPLIED HERE: Buffer.from() ---
              await client.invoke(new Api.upload.SaveBigFilePart({
                 fileId: BigInt(state.fileId),
                 filePart: partIdx,
                 fileTotalParts: state.totalParts,
-                bytes: buffer
+                bytes: Buffer.from(buffer) // WRAP IN BUFFER
             }));
         }
 
@@ -179,7 +171,6 @@ async function runRelay(link, chatId, env, startPart) {
             message: `📦 **${state.filename}**`
         }));
         
-        // Cleanup KV
         await env.LEECH_DB.delete(link);
 
     } catch (e) {
@@ -190,14 +181,8 @@ async function runRelay(link, chatId, env, startPart) {
     }
 }
 
-// --- RECURSIVE TRIGGER ---
 async function triggerNextWorker(env, link, chatId, nextPart) {
-    if (!env.WORKER_URL) {
-         console.error("WORKER_URL missing");
-         return;
-    }
-    
-    // Call ourself with ?resume=true
+    if (!env.WORKER_URL) return;
     fetch(`${env.WORKER_URL}?resume=true`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
