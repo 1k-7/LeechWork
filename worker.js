@@ -1,8 +1,8 @@
 /**
- * CLOUDFLARE LEECH BOT (FINAL STABLE)
- * - SERVICE BINDING: No 404 errors.
- * - BROWSER HEADERS: Bypasses source server blocks.
- * - DIAGNOSTICS: Shows exactly what the bot is doing.
+ * CLOUDFLARE LEECH BOT (FINAL POLISH)
+ * - FIX: /ping loop (Returns correct HTTP 200).
+ * - FIX: Stream Hang (Added 'Accept-Encoding: identity').
+ * - FEATURE: Service Binding (No 404s).
  */
 
 import { Api, TelegramClient } from "telegram";
@@ -29,7 +29,7 @@ export default {
       try {
         const update = await request.json();
 
-        // HANDOFF
+        // 1. HANDOFF (Userbot -> Bot)
         if (update.message && (update.message.document || update.message.video || update.message.audio)) {
             const caption = update.message.caption;
             if (caption && /^-?\d+$/.test(caption)) {
@@ -38,12 +38,16 @@ export default {
             }
         }
 
-        // COMMANDS
+        // 2. COMMANDS
         if (update.message && update.message.text) {
             const text = update.message.text;
             const chatId = update.message.chat.id;
 
-            if (text === "/ping") return sendMessage(env, chatId, "🏓 **Pong!**\nService Binding: " + (env.SELF ? "✅ Active" : "❌ Missing"));
+            // FIX: PING COMMAND MUST RETURN RESPONSE "OK"
+            if (text === "/ping") {
+                await sendMessage(env, chatId, "🏓 **Pong!**\nService Binding: " + (env.SELF ? "✅ Active" : "❌ Missing"));
+                return new Response("OK"); // <--- THIS STOPS THE SPAM
+            }
 
             if (text.startsWith("/leech")) {
                 const link = text.split(/\s+/)[1];
@@ -72,7 +76,6 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         const START_TIME = Date.now();
         const MAX_RUNTIME = 50 * 1000;
 
-        // DIAGNOSTIC 1
         if (startPart === 0) await editMessage(env, chatId, msgId, "🔑 **Logging in...**");
 
         const session = new StringSession(env.SESSION_STRING);
@@ -83,16 +86,14 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         
         // INIT STATE
         if (startPart === 0 || !state) {
-            // DIAGNOSTIC 2
             await editMessage(env, chatId, msgId, "📡 **Fetching Headers...**");
 
-            // HEAD REQUEST WITH BROWSER HEADERS (The Fix)
+            // HEAD REQUEST
             const head = await fetch(link, { 
                 method: "HEAD", 
                 headers: { 
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "*/*",
-                    "Connection": "keep-alive"
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept-Encoding": "identity" // Force RAW bytes
                 } 
             });
             
@@ -118,18 +119,28 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         const CHUNK_SIZE = 512 * 1024;
         const byteStart = startPart * CHUNK_SIZE;
 
-        // DIAGNOSTIC 3
         if (startPart === 0) await editMessage(env, chatId, msgId, "⬇️ **Starting Stream...**");
         
-        // GET REQUEST WITH BROWSER HEADERS
-        const response = await fetch(link, { 
-            headers: { 
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-                "Range": `bytes=${byteStart}-`,
-                "Accept": "*/*",
-                "Referer": new URL(link).origin
-            } 
-        });
+        // GET REQUEST (Stream)
+        // Added AbortController to kill hangs after 10s
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+
+        let response;
+        try {
+            response = await fetch(link, { 
+                headers: { 
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Range": `bytes=${byteStart}-`,
+                    "Accept": "*/*",
+                    "Accept-Encoding": "identity" // CRITICAL FIX
+                },
+                signal: controller.signal
+            });
+            clearTimeout(timeout);
+        } catch (e) {
+            throw new Error("Stream Connection Timed Out");
+        }
 
         if (!response.ok) throw new Error(`Stream HTTP ${response.status}`);
 
@@ -160,7 +171,6 @@ async function runRelay(link, chatId, env, startPart, msgId) {
 
             const { done, value } = await reader.read();
             
-            // DIAGNOSTIC 4: Confirm we actually got data
             if (!streamActive && value) {
                 streamActive = true;
                 if (startPart === 0) await editMessage(env, chatId, msgId, "🚀 **Stream Active! Uploading...**");
