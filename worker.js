@@ -1,15 +1,13 @@
 /**
- * CLOUDFLARE LEECH BOT (Connection Fix)
- * - Added "Browser Headers" to bypass source blocking.
- * - Added Stream Timeout to detect hangs instantly.
- * - Same stable 2x Parallelism.
+ * CLOUDFLARE LEECH BOT (BULLETPROOF)
+ * - FIXES: "Stuck at Uploading" by adding timeouts.
+ * - MODE: Sequential (1 by 1) for maximum stability.
+ * - RETRY: Auto-kicks "frozen" uploads.
  */
 
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { Buffer } from "node:buffer";
-
-const PARALLEL_CHUNKS = 2; 
 
 export default {
   async fetch(request, env, ctx) {
@@ -37,7 +35,7 @@ export default {
 
             if (!env.LEECH_DB || !env.WORKER_URL) return sendMessage(env, chatId, "❌ Error: Config missing.");
 
-            const statusMsg = await sendMessage(env, chatId, "⚙️ **Initializing...**");
+            const statusMsg = await sendMessage(env, chatId, "🛡️ **Bulletproof Mode Init...**");
             const msgId = statusMsg.result.message_id;
 
             ctx.waitUntil(runRelay(link, chatId, env, 0, msgId));
@@ -62,7 +60,7 @@ async function runRelay(link, chatId, env, startPart, msgId) {
     let client;
     try {
         const START_TIME = Date.now();
-        const MAX_RUNTIME = 45 * 1000; 
+        const MAX_RUNTIME = 50 * 1000; 
 
         if (startPart === 0) await editMessage(env, chatId, msgId, "🔑 **Logging in...**");
         
@@ -70,16 +68,16 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         client = new TelegramClient(session, parseInt(env.API_ID), env.API_HASH, { connectionRetries: 1, useWSS: true });
         await client.connect();
 
+        // METADATA
         let state = await env.LEECH_DB.get(link, { type: "json" });
         
         if (startPart === 0 || !state) {
             await editMessage(env, chatId, msgId, "📡 **Fetching Headers...**");
             
-            // HEAD request with browser headers
             const head = await fetch(link, { 
                 method: "HEAD", 
                 headers: {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
                     "Accept": "*/*",
                     "Connection": "keep-alive"
                 } 
@@ -87,7 +85,6 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             if (!head.ok) throw new Error(`Source HTTP ${head.status}`);
             
             const totalSize = parseInt(head.headers.get("content-length") || "0");
-            
             let filename = "video.mp4";
             const disp = head.headers.get("content-disposition");
             if (disp && disp.includes("filename=")) {
@@ -103,20 +100,18 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             await env.LEECH_DB.put(link, JSON.stringify(state), { expirationTtl: 86400 });
         }
 
-        // STEP 3: STREAMING (With improved headers)
-        if (startPart === 0) await editMessage(env, chatId, msgId, "⬇️ **Starting Stream...**");
+        // STREAMING
+        if (startPart === 0) await editMessage(env, chatId, msgId, "⬇️ **Streaming...**");
 
         const CHUNK_SIZE = 512 * 1024;
         const byteStart = startPart * CHUNK_SIZE;
 
-        // FETCH WITH BROWSER HEADERS
         const response = await fetch(link, { 
             headers: { 
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
                 "Range": `bytes=${byteStart}-`,
                 "Accept": "*/*",
-                "Referer": new URL(link).origin, // Sometimes required
-                "Connection": "keep-alive"
+                "Referer": new URL(link).origin
             } 
         });
 
@@ -126,23 +121,16 @@ async function runRelay(link, chatId, env, startPart, msgId) {
         let partIdx = startPart;
         let buffer = new Uint8Array(0);
         let lastEditTime = Date.now();
-        let streamActive = false; // To track if we actually got data
 
-        // STEP 4: UPLOAD LOOP
+        // UPLOAD LOOP
         while (true) {
+            // RELAY CHECK
             if (Date.now() - START_TIME > MAX_RUNTIME) {
                 await triggerNextWorker(env, link, chatId, partIdx, msgId);
                 return;
             }
 
-            // READ CHUNK
             const { done, value } = await reader.read();
-            if (!streamActive && value) {
-                // If we got the first byte, update status immediately
-                streamActive = true;
-                if (startPart === 0) await editMessage(env, chatId, msgId, "🚀 **Stream Active! Uploading...**");
-            }
-
             if (done && buffer.length === 0) break;
             
             if (value) {
@@ -152,33 +140,47 @@ async function runRelay(link, chatId, env, startPart, msgId) {
                 buffer = temp;
             }
 
+            // PROCESS CHUNKS SEQUENTIALLY (Bulletproof)
             while (buffer.length >= CHUNK_SIZE || (done && buffer.length > 0)) {
                 
-                const uploadPromises = [];
-                let loopCount = 0;
+                const currentChunkSize = Math.min(CHUNK_SIZE, buffer.length);
+                const chunk = buffer.slice(0, currentChunkSize);
+                buffer = buffer.slice(currentChunkSize);
 
-                while (loopCount < PARALLEL_CHUNKS && buffer.length > 0) {
-                    const currentChunkSize = Math.min(CHUNK_SIZE, buffer.length);
-                    const chunk = buffer.slice(0, currentChunkSize);
-                    buffer = buffer.slice(currentChunkSize);
+                // --- SAFE UPLOAD WITH TIMEOUT ---
+                // We wrap the upload in a race condition. If it takes > 15s, we retry.
+                let success = false;
+                let attempts = 0;
 
-                    const currentPart = partIdx;
-                    const p = client.invoke(new Api.upload.SaveBigFilePart({
-                        fileId: BigInt(state.fileId),
-                        filePart: currentPart,
-                        fileTotalParts: state.totalParts,
-                        bytes: Buffer.from(chunk)
-                    }));
+                while (!success && attempts < 3) {
+                    try {
+                        const uploadPromise = client.invoke(new Api.upload.SaveBigFilePart({
+                            fileId: BigInt(state.fileId),
+                            filePart: partIdx,
+                            fileTotalParts: state.totalParts,
+                            bytes: Buffer.from(chunk)
+                        }));
 
-                    uploadPromises.push(p);
-                    partIdx++;
-                    loopCount++;
-                    
-                    if (currentChunkSize < CHUNK_SIZE) break;
+                        // Timeout Promise
+                        const timeoutPromise = new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error("Upload Timeout")), 15000)
+                        );
+
+                        await Promise.race([uploadPromise, timeoutPromise]);
+                        success = true;
+
+                    } catch (err) {
+                        console.log(`Part ${partIdx} stalled/failed. Retrying... (${attempts+1}/3)`);
+                        attempts++;
+                        await new Promise(r => setTimeout(r, 1000)); // Cool down
+                    }
                 }
 
-                if (uploadPromises.length > 0) await Promise.all(uploadPromises);
+                if (!success) throw new Error(`Part ${partIdx} Failed after 3 retries.`);
 
+                partIdx++;
+
+                // UPDATE UI (Every 8s)
                 if (Date.now() - lastEditTime > 8000) {
                     await editProgress(env, chatId, msgId, state.filename, partIdx, state.totalParts, state.totalSize);
                     lastEditTime = Date.now();
@@ -190,8 +192,8 @@ async function runRelay(link, chatId, env, startPart, msgId) {
             if (done && buffer.length === 0) break;
         }
 
-        // STEP 5: FINISH
-        await editMessage(env, chatId, msgId, "✅ **100%!** Processing...");
+        // FINISH
+        await editMessage(env, chatId, msgId, "✅ **100%!** Sending...");
 
         const ext = state.filename.split('.').pop().toLowerCase();
         let mimeType = "video/mp4";
@@ -227,7 +229,7 @@ async function runRelay(link, chatId, env, startPart, msgId) {
     }
 }
 
-// --- VISUAL HELPERS ---
+// --- HELPERS ---
 async function editProgress(env, chatId, msgId, name, current, total, size) {
     const percent = Math.min(100, (current / total) * 100);
     const filled = Math.floor(percent / 10);
@@ -236,7 +238,7 @@ async function editProgress(env, chatId, msgId, name, current, total, size) {
     const totalMB = (size / 1024 / 1024).toFixed(2);
     
     await editMessage(env, chatId, msgId, 
-        `⚡ **Leeching...**\n📄 \`${name}\`\n📊 ${bar} **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
+        `🛡️ **Bulletproof...**\n📄 \`${name}\`\n📊 ${bar} **${percent.toFixed(1)}%**\n💾 ${uploadedMB}MB / ${totalMB}MB`
     );
 }
 
