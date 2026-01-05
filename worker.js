@@ -1,13 +1,13 @@
 /**
- * CLOUDFLARE "RELAY" LEECH BOT (Native KV Version)
- * - Fixed Import URLs (Double Slash)
+ * CLOUDFLARE "RELAY" LEECH BOT (Bundled Version)
+ * - Uses local 'telegram' package (Fixes "No such module" error)
  * - Uploads 2GB+ files via Relay
  * - Uses Cloudflare KV (LEECH_DB) for state
  */
 
-// FORCE UPDATE: v2
-import { Api, TelegramClient } from "https://esm.sh/telegram@2.22.2?cache=bust";
-import { StringSession } from "https://esm.sh/telegram@2.22.2/sessions?cache=bust";
+// STANDARD IMPORTS (No URLs)
+import { Api, TelegramClient } from "telegram";
+import { StringSession } from "telegram/sessions";
 
 export default {
   async fetch(request, env, ctx) {
