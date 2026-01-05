@@ -1,37 +1,36 @@
 /**
- * HYBRID LEECH BOT (Final Debug Version)
- * - Reports exact errors if GitHub fails to trigger.
- * - Handles Cobalt resolution for social links.
+ * CLOUDFLARE "RELAY" LEECH BOT (Native KV Version)
+ * - Uploads 2GB+ files.
+ * - Auto-Resumes on timeout (Relay Mode).
+ * - Uses Cloudflare KV for state (No MongoDB required).
  */
+
+import { Api, TelegramClient } from "https://esm.sh/telegram@2.22.2";
+import { StringSession } from "https://esm.sh/telegram@2.22.2/sessions";
 
 export default {
   async fetch(request, env, ctx) {
-    if (request.method === "POST") {
+    const url = new URL(request.url);
+
+    // --- ROUTE 1: TELEGRAM COMMANDS ---
+    if (request.method === "POST" && !url.searchParams.has("resume")) {
       try {
         const update = await request.json();
         if (update.message && update.message.text) {
           const text = update.message.text;
           const chatId = update.message.chat.id;
 
-          if (text === "/start") {
-             await sendMessage(env.BOT_TOKEN, chatId, 
-               "👋 **Hybrid Leech Bot**\n\n" +
-               "🔹 **< 50MB:** Instant Cloudflare Upload\n" +
-               "🔹 **> 50MB:** Auto-offload to GitHub\n\n" +
-               "**Usage:** `/leech <link>`"
-             );
-             return new Response("OK");
-          }
-
           if (text.startsWith("/leech")) {
-            const url = text.split(/\s+/)[1];
-            if (!url) {
-              await sendMessage(env.BOT_TOKEN, chatId, "❌ **Usage:** `/leech <url>`");
-              return new Response("OK");
-            }
+            const link = text.split(/\s+/)[1];
+            if (!link) return sendMessage(env, chatId, "❌ Usage: `/leech <link>`");
 
-            await sendMessage(env.BOT_TOKEN, chatId, "🔍 **Analyzing...**");
-            ctx.waitUntil(handleRequest(url, chatId, env));
+            // Check if KV is bound
+            if (!env.LEECH_DB) return sendMessage(env, chatId, "❌ **Config Error:** Please bind a KV Namespace named `LEECH_DB` in settings.");
+
+            await sendMessage(env, chatId, "🚀 **Job Started.** Initializing...");
+            
+            // Start the relay (Part 0)
+            ctx.waitUntil(runRelay(link, chatId, env, 0));
             return new Response("OK");
           }
         }
@@ -39,152 +38,174 @@ export default {
         return new Response("Error", { status: 200 });
       }
     }
+
+    // --- ROUTE 2: RELAY RUNNER (Internal) ---
+    if (request.method === "POST" && url.searchParams.get("resume") === "true") {
+      const payload = await request.json();
+      ctx.waitUntil(runRelay(payload.link, payload.chatId, env, payload.nextPart));
+      return new Response("Relay Picked Up");
+    }
+
     return new Response("Bot Active");
   }
 };
 
-async function handleRequest(userUrl, chatId, env) {
+// --- MAIN RELAY LOGIC ---
+async function runRelay(link, chatId, env, startPart) {
+    let client;
     try {
-        let finalUrl = userUrl;
-        let filename = "download";
+        const START_TIME = Date.now();
+        const MAX_RUNTIME = 80 * 1000; // 80s Limit
+
+        // 1. SETUP CLIENT
+        if (!env.SESSION_STRING) throw new Error("Missing SESSION_STRING variable.");
         
-        // 1. Resolve Social Media
-        const isSocial = /youtube|youtu\.be|tiktok|instagram|twitter|x\.com|twitch/.test(userUrl);
-        if (isSocial) {
-            await sendMessage(env.BOT_TOKEN, chatId, "⚙️ **Resolving via Cobalt...**");
-            const cobalt = await resolveCobalt(userUrl);
-            if (!cobalt) {
-                if (env.GITHUB_TOKEN) {
-                     await sendMessage(env.BOT_TOKEN, chatId, "⚠️ Cobalt failed. Trying GitHub directly...");
-                     await triggerGitHub(userUrl, chatId, env);
-                     return;
-                }
-                throw new Error("Link not supported by Cobalt.");
-            }
-            finalUrl = cobalt.url;
-            if (cobalt.filename) filename = cobalt.filename;
-        }
-
-        // 2. Check File Size
-        let size = 0;
-        try {
-            const head = await fetch(finalUrl, { method: "HEAD", headers: {"User-Agent": "Mozilla/5.0"} });
-            if (head.ok) size = parseInt(head.headers.get("content-length") || "0");
-        } catch (e) {}
-
-        // 3. Decision
-        if (size > 52428800) { 
-            if (env.GITHUB_TOKEN) {
-                await sendMessage(env.BOT_TOKEN, chatId, `📦 **File is ${(size/1024/1024).toFixed(2)}MB** (>50MB).\n🚀 sending signal to GitHub...`);
-                await triggerGitHub(userUrl, chatId, env);
-            } else {
-                throw new Error("File too big (>50MB) and no GITHUB_TOKEN configured.");
-            }
-        } else {
-            await streamToTelegram(finalUrl, chatId, env.BOT_TOKEN, filename);
-        }
-
-    } catch (error) {
-        await sendMessage(env.BOT_TOKEN, chatId, `❌ **Error:** ${error.message}`);
-    }
-}
-
-// --- DEBUG TRIGGER GITHUB ---
-async function triggerGitHub(url, chatId, env) {
-    if (!env.GITHUB_TOKEN || !env.GITHUB_REPO) {
-        throw new Error("Missing GITHUB_TOKEN or GITHUB_REPO in Settings.");
-    }
-    
-    // Log the attempt to Telegram
-    const repo = env.GITHUB_REPO;
-    
-    const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
-        method: "POST",
-        headers: {
-            "Authorization": `token ${env.GITHUB_TOKEN}`,
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "Cloudflare-Worker"
-        },
-        body: JSON.stringify({ event_type: "big_leech", client_payload: { url: url, chat_id: chatId } })
-    });
-
-    if (!res.ok) {
-        const err = await res.text();
-        await sendMessage(env.BOT_TOKEN, chatId, `❌ **GitHub Refused!**\nStatus: ${res.status}\nReason: ${err}\n\n*Check your GITHUB_REPO and GITHUB_TOKEN settings.*`);
-    } else {
-        await sendMessage(env.BOT_TOKEN, chatId, "✅ **Signal Sent!**\nWaiting for GitHub to wake up (10-30s)...");
-    }
-}
-
-// --- STANDARD HELPERS ---
-async function streamToTelegram(fileUrl, chatId, botToken, suggestedName) {
-    try {
-        const source = await fetch(fileUrl, { headers: {"User-Agent": "Mozilla/5.0"} });
-        if (!source.ok) throw new Error("Source URL unreachable");
-        
-        let fileSize = parseInt(source.headers.get("content-length") || "0");
-        let stream = source.body;
-        if (!fileSize) {
-             const blob = await source.blob();
-             fileSize = blob.size;
-             stream = blob.stream();
-        }
-
-        let filename = suggestedName;
-        const disp = source.headers.get("content-disposition");
-        if (disp && disp.includes("filename=")) filename = disp.match(/filename=["']?([^"';]+)["']?/)[1];
-        if (!filename.includes(".")) filename += ".mp4";
-
-        await sendMessage(botToken, chatId, `⬇️ **Streaming:** \`${filename}\``);
-
-        const boundary = "----Cloudflare" + Math.random().toString(36).slice(2);
-        const header = `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n` +
-                       `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\n` +
-                       `Content-Type: application/octet-stream\r\n\r\n`;
-        const footer = `\r\n--${boundary}--\r\n`;
-        
-        const { readable, writable } = new TransformStream();
-        const writer = writable.getWriter();
-        const enc = new TextEncoder();
-        
-        (async () => {
-            await writer.write(enc.encode(header));
-            const reader = stream.getReader();
-            while (true) { const {done, value} = await reader.read(); if(done) break; await writer.write(value); }
-            await writer.write(enc.encode(footer));
-            await writer.close();
-        })();
-
-        const res = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
-            method: "POST", 
-            headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` }, 
-            body: readable
+        const session = new StringSession(env.SESSION_STRING);
+        client = new TelegramClient(session, parseInt(env.API_ID), env.API_HASH, {
+            connectionRetries: 1, useWSS: true
         });
-        if (!res.ok) throw new Error("Telegram Rejected Upload");
+        await client.connect();
+
+        // 2. GET STATE FROM KV
+        let state = await env.LEECH_DB.get(link, { type: "json" });
+        
+        // Fetch Source Info
+        const head = await fetch(link, { method: "HEAD", headers: {"User-Agent": "Mozilla/5.0"} });
+        const totalSize = parseInt(head.headers.get("content-length") || "0");
+        const supportsRange = head.headers.get("accept-ranges") === "bytes";
+
+        if (!supportsRange && totalSize > 50*1024*1024) {
+            throw new Error("Source server doesn't support resuming (Range Headers). Cannot process huge file.");
+        }
+
+        // Initialize State if new
+        if (startPart === 0 || !state) {
+            const fileId = BigInt(Math.floor(Math.random() * 1000000000000)).toString();
+            const CHUNK_SIZE = 512 * 1024;
+            const totalParts = Math.ceil(totalSize / CHUNK_SIZE);
+            const filename = link.split("/").pop().split("?")[0] || "video.mp4";
+            
+            state = { fileId, totalParts, filename, totalSize };
+            // Save to KV (Expire in 24 hours to clean up)
+            await env.LEECH_DB.put(link, JSON.stringify(state), { expirationTtl: 86400 });
+            
+            await sendMessage(env, chatId, `📦 **File Details:**\n\`${filename}\`\nSize: ${(totalSize/1024/1024).toFixed(2)}MB\nTotal Parts: ${totalParts}`);
+        }
+
+        // 3. CALCULATE OFFSETS
+        const CHUNK_SIZE = 512 * 1024;
+        const byteStart = startPart * CHUNK_SIZE;
+        
+        // 4. FETCH SOURCE STREAM
+        const response = await fetch(link, {
+            headers: { 
+                "User-Agent": "Mozilla/5.0",
+                "Range": `bytes=${byteStart}-` 
+            }
+        });
+
+        if (!response.ok && response.status !== 206) throw new Error("Stream connection failed.");
+
+        // 5. UPLOAD LOOP
+        const reader = response.body.getReader();
+        let partIdx = startPart;
+        let buffer = new Uint8Array(0);
+
+        while (true) {
+            // TIME CHECK
+            if (Date.now() - START_TIME > MAX_RUNTIME) {
+                // Trigger Relay
+                await triggerNextWorker(env, link, chatId, partIdx);
+                
+                // Update User
+                const percent = (partIdx / state.totalParts) * 100;
+                // Only send log if percent changed significantly (avoid flood)
+                if (partIdx % 10 === 0) {
+                     await sendMessage(env, chatId, `🔄 **Relaying...** (${percent.toFixed(1)}%)`);
+                }
+                return;
+            }
+
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const newBuffer = new Uint8Array(buffer.length + value.length);
+            newBuffer.set(buffer);
+            newBuffer.set(value, buffer.length);
+            buffer = newBuffer;
+
+            while (buffer.length >= CHUNK_SIZE) {
+                const chunk = buffer.slice(0, CHUNK_SIZE);
+                buffer = buffer.slice(CHUNK_SIZE);
+
+                // MTProto Upload
+                await client.invoke(new Api.upload.SaveBigFilePart({
+                    fileId: BigInt(state.fileId),
+                    filePart: partIdx,
+                    fileTotalParts: state.totalParts,
+                    bytes: chunk
+                }));
+                partIdx++;
+            }
+        }
+
+        // Flush Buffer
+        if (buffer.length > 0) {
+             await client.invoke(new Api.upload.SaveBigFilePart({
+                fileId: BigInt(state.fileId),
+                filePart: partIdx,
+                fileTotalParts: state.totalParts,
+                bytes: buffer
+            }));
+        }
+
+        // 6. FINALIZE
+        await sendMessage(env, chatId, "✅ **Upload 100%!** Finalizing...");
+        
+        await client.invoke(new Api.messages.SendMedia({
+            peer: chatId,
+            media: new Api.InputMediaUploadedDocument({
+                file: new Api.InputFileBig({
+                    id: BigInt(state.fileId),
+                    parts: state.totalParts,
+                    name: state.filename
+                }),
+                mimeType: "video/mp4",
+                attributes: [new Api.DocumentAttributeVideo({ 
+                    duration: 0, w: 1280, h: 720, supportsStreaming: true 
+                })]
+            }),
+            message: `📦 **${state.filename}**`
+        }));
+        
+        // Cleanup KV
+        await env.LEECH_DB.delete(link);
 
     } catch (e) {
-        throw e;
+        await sendMessage(env, chatId, `❌ **Error:** ${e.message}`);
+        console.error(e);
+    } finally {
+        if (client) await client.disconnect();
     }
 }
 
-async function resolveCobalt(url) {
-    const instances = ["https://api.cobalt.tools/api/json", "https://co.wuk.sh/api/json", "https://api.wkr.tools/api/json"];
-    for (const api of instances) {
-        try {
-            const res = await fetch(api, {
-                method: "POST",
-                headers: {"Accept": "application/json", "Content-Type": "application/json"},
-                body: JSON.stringify({ url: url, downloadMode: "auto" })
-            });
-            const data = await res.json();
-            if (data.url) return data;
-        } catch (e) {}
+// --- RECURSIVE TRIGGER ---
+async function triggerNextWorker(env, link, chatId, nextPart) {
+    if (!env.WORKER_URL) {
+         // Fallback: Try to guess worker URL from request? No, explicit is safer.
+         console.error("WORKER_URL missing");
+         return;
     }
-    return null;
+    
+    fetch(`${env.WORKER_URL}?resume=true`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ link, chatId, nextPart })
+    }).catch(e => console.log("Spawn failed", e));
 }
 
-async function sendMessage(token, chatId, text) {
-  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+async function sendMessage(env, chatId, text) {
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: "Markdown" })
