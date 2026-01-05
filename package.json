@@ -1,0 +1,8 @@
+{
+  "name": "leech-bot",
+  "version": "1.0.0",
+  "main": "worker.js",
+  "dependencies": {
+    "telegram": "^2.22.2"
+  }
+}
