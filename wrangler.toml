@@ -1,6 +1,8 @@
-name = "leech-bot"
+name = "leework"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-[observability]
-enabled = true
+# This binding ensures your KV Database is not deleted during deploy
+[[kv_namespaces]]
+binding = "LEECH_DB"
+id = "13fbf5261f684cb5b7f8b60df34826e2"
